@@ -484,9 +484,7 @@ class BrowserSession:
         if await messages.count() <= baseline_count:
             return ""
         source = await messages.last.evaluate(AGENT_SOURCE_EXTRACTOR)
-        if not isinstance(source, str):
-            raise AgentTransportError("Assistant source extraction failed; no tool call emitted")
-        return source
+        return source if isinstance(source, str) else None
 
     async def _is_generating(self, page: Page) -> bool:
         try:
@@ -709,7 +707,7 @@ class BrowserSession:
                 transport.check()
             await asyncio.sleep(0.3)
             answer = await self._answer(page, baseline_count, structured)
-            if answer.strip() or transport.request is not None or await self._is_generating(page):
+            if (answer and answer.strip()) or transport.request is not None or await self._is_generating(page):
                 break
         else:
             await self._shot(page, "start_timeout")
@@ -718,6 +716,7 @@ class BrowserSession:
         # --- читаем поток ---
         deadline = time.monotonic() + GEN_TIMEOUT
         last_change = time.monotonic()
+        finished_seen = None
         # The web UI can rewrite partial Markdown. Buffer until completion
         # rather than emitting an irreversible, corrupted SSE prefix.
 
@@ -726,6 +725,8 @@ class BrowserSession:
                 transport.check()
             await asyncio.sleep(0.25)
             current = await self._answer(page, baseline_count, structured)
+            if transport.finished and finished_seen is None:
+                finished_seen = time.monotonic()
 
             if current != answer:
                 answer = current
@@ -733,12 +734,17 @@ class BrowserSession:
                 continue
 
             idle = time.monotonic() - last_change
-            if idle >= STABLE_SEC and transport.finished and not await self._is_generating(page):
+            settle_window = max(STABLE_SEC, 5) if current is None else STABLE_SEC
+            if (idle >= STABLE_SEC and finished_seen is not None
+                    and time.monotonic() - finished_seen >= settle_window
+                    and not await self._is_generating(page)):
                 break
         else:
             raise RuntimeError("Generation deadline exceeded; refusing to report a normal completion")
 
         await self._shot(page, "done")
+        if answer is None:
+            raise AgentTransportError("Assistant source extraction failed after completed response; no tool call emitted")
         if not answer.strip():
             raise RuntimeError("Model returned no assistant content")
         answer = answer.strip()

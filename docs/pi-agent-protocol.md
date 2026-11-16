@@ -208,3 +208,14 @@ Valid final text, even a false tool-failure story, is NOT filtered or regenerate
 This explicitly supersedes the earlier zero-regeneration policy, not strict
 validation or the rule that only Pi executes tools. It does NOT certify model
 truthfulness, unattended hours, or the correctness of a proposed patch.
+
+Pending React source is not a completed source-contract failure: placeholder
+messages can have no readable source WHILE the browser request is still active.
+Wait for the matching request to finish and a post-finish settlement window
+(5s for unknown source, normal stable window for strings). Only then may a
+remaining unknown source become a typed transport error. Never serialize an
+internal sentinel as a plain response or compaction summary. Live rollout of the
+first typed-source check exposed this timing regression; the pending→valid and
+completed→unavailable paths now have separate regression coverage.
+Rejected model output MAY echo sensitive user context; protected receipts are
+private, despite never reading/copying browser auth headers, cookies or profiles.

@@ -246,8 +246,8 @@ A malformed agent reply gets at most ONE explicit regeneration, never JSON repai
 Pi sees a bridge notice with diagnostic ID. Only a newly validated envelope emits
 a tool call; a second failure remains an error. Transport and source extraction
 errors do not retry. Protected bounded rejected-output receipts live inside the
-bridge at /tmp/venice-agent-rejections (0700/0600, latest8,64KiB each); no host
-prompt/authentication data is captured. These ephemeral files disappear on pod
+bridge at /tmp/venice-agent-rejections (0700/0600, latest8,64KiB each); the host prompt, auth headers, cookies and profiles are not separately captured.
+Rejected model output can still echo sensitive user context; treat receipts as private. These ephemeral files disappear on pod
 replacement. AGENT_REJECTION_DIR="" disables capture. Valid assistant prose is
 not filtered, including false failure stories: use actual Pi events as evidence.
 See docs/pi-agent-protocol.md for usage accounting and remaining reliability limits.

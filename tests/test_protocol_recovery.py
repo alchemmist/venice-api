@@ -98,9 +98,45 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         page.locator.return_value.count=AsyncMock(return_value=1)
         page.locator.return_value.last.evaluate=AsyncMock(return_value=None)
         session=main.BrowserSession()
-        with self.assertRaises(main.AgentTransportError): await session._answer(page,0)
+        self.assertIsNone(await session._answer(page,0))
         page.locator.return_value.last.evaluate=AsyncMock(return_value='INVALID_AGENT_SOURCE')
         self.assertEqual(await session._answer(page,0),'INVALID_AGENT_SOURCE')
+    async def test_pending_source_is_not_a_fatal_extraction_failure(self):
+        page=MagicMock()
+        page.locator.return_value.count=AsyncMock(return_value=0)
+        page.locator.return_value.first.click=AsyncMock()
+        page.locator.return_value.first.fill=AsyncMock()
+        page.locator.return_value.click=AsyncMock()
+        page.locator.return_value.fill=AsyncMock()
+        page.locator.return_value.press=AsyncMock()
+        page.keyboard.insert_text=AsyncMock()
+        page.keyboard.press=AsyncMock()
+        page.wait_for_timeout=AsyncMock()
+        page.route=AsyncMock()
+        page.unroute=AsyncMock()
+        session=main.BrowserSession()
+        session._page_or_start=AsyncMock(return_value=page)
+        session._prepare=AsyncMock()
+        session._is_generating=AsyncMock(return_value=False)
+        session._shot=AsyncMock()
+        transport=MagicMock(finished=False)
+        transport.route=AsyncMock()
+        count=0
+        async def answer(*args):
+            nonlocal count
+            count+=1
+            if count<3:return None
+            transport.finished=True
+            return CALL
+        session._answer=answer
+        with patch.object(main, 'AgentBrowserTransport', return_value=transport), patch.object(main, 'STABLE_SEC', -1), patch.object(main.asyncio, 'sleep', AsyncMock()):
+            self.assertEqual(await session.complete('fixture',structured=True),CALL)
+        self.assertGreaterEqual(count,4)
+        session._answer=AsyncMock(return_value=None)
+        with patch.object(main, 'AgentBrowserTransport', return_value=transport), patch.object(main, 'STABLE_SEC', -1), patch.object(main, 'max', return_value=-1, create=True), patch.object(main.asyncio, 'sleep', AsyncMock()):
+            with self.assertRaises(main.AgentTransportError): await session.complete('fixture',structured=True)
+        self.assertFalse(session._lock.locked())
+
     def test_diagnostics_are_bounded_and_unsafe_directory_is_refused(self):
         for i in range(11): main._record_rejection('x'*70000,'invalid','fixture',i)
         paths=list(self.root.glob('*.json'))
