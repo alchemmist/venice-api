@@ -114,6 +114,8 @@ PORT         = int(os.getenv("PORT", "8080"))
 GEN_TIMEOUT  = float(os.getenv("GEN_TIMEOUT", "600"))    # макс. время генерации, сек
 START_TIMEOUT= float(os.getenv("START_TIMEOUT", "90"))   # ожидание начала ответа, сек
 STABLE_SEC   = float(os.getenv("STABLE_SEC", "2.0"))     # «тишина» = конец ответа
+MAX_PENDING_REQUESTS = max(1, int(os.getenv("MAX_PENDING_REQUESTS", "4")))
+QUEUE_TIMEOUT = float(os.getenv("QUEUE_TIMEOUT", "180"))
 MODEL_SELECT_TIMEOUT = float(os.getenv("MODEL_SELECT_TIMEOUT", "20"))
 NAV_TIMEOUT  = float(os.getenv("NAV_TIMEOUT", "90"))
 DEBUG        = _env_bool("DEBUG", False)
@@ -177,6 +179,10 @@ window.chrome = window.chrome || { runtime: {} };
 """
 
 
+class BrowserBusyError(RuntimeError):
+    pass
+
+
 class BrowserSession:
     """Единственная страница, единственный контекст, сериализация запросов."""
 
@@ -186,6 +192,33 @@ class BrowserSession:
         self._page: Optional[Page] = None
         self._lock = asyncio.Lock()
         self._cdp = False
+        self._pending = 0
+
+    @asynccontextmanager
+    async def request_slot(self):
+        if self._pending >= MAX_PENDING_REQUESTS:
+            raise BrowserBusyError("Browser queue is full; retry later")
+        self._pending += 1
+        acquired = False
+        try:
+            try:
+                await asyncio.wait_for(self._lock.acquire(), timeout=QUEUE_TIMEOUT)
+                acquired = True
+            except asyncio.TimeoutError:
+                raise BrowserBusyError("Browser queue wait timed out; retry later") from None
+            try:
+                yield
+            except asyncio.CancelledError:
+                if self._page and not self._page.is_closed():
+                    with contextlib.suppress(Exception):
+                        stop = self._page.locator(SEL_STOP).first
+                        if await stop.count() and await stop.is_visible():
+                            await stop.click(timeout=1000)
+                raise
+        finally:
+            if acquired:
+                self._lock.release()
+            self._pending -= 1
 
     # ------------------------- низкий уровень ------------------------------ #
 
@@ -505,7 +538,7 @@ class BrowserSession:
         prompt: str,
         on_delta: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> str:
-        async with self._lock:
+        async with self.request_slot():
             page = await self._page_or_start()
             try:
                 await self._prepare(page)
@@ -754,6 +787,8 @@ async def chat_completions(req: ChatCompletionRequest):
     if not req.stream:
         try:
             text = await SESSION.complete(prompt)
+        except BrowserBusyError as exc:
+            raise HTTPException(429, str(exc), headers={"Retry-After": "5"}) from None
         except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка генерации")
             raise HTTPException(502, f"Ошибка браузерной сессии: {exc}") from exc
@@ -782,9 +817,11 @@ async def chat_completions(req: ChatCompletionRequest):
         try:
             text = await SESSION.complete(prompt, on_delta)
             await queue.put(("final", text))
+        except BrowserBusyError as exc:
+            await queue.put(("error", {"message": str(exc), "type": "rate_limit_error", "code": 429}))
         except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка генерации (stream)")
-            await queue.put(("error", str(exc)))
+            await queue.put(("error", {"message": str(exc), "type": "upstream_error"}))
 
     def sse(obj: dict[str, Any]) -> str:
         return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
@@ -802,8 +839,8 @@ async def chat_completions(req: ChatCompletionRequest):
 
     async def streamer():
         task = asyncio.create_task(worker())
-        yield chunk({"role": "assistant", "content": ""})
         try:
+            yield chunk({"role": "assistant", "content": ""})
             while True:
                 try:
                     kind, payload = await asyncio.wait_for(queue.get(), timeout=15)
@@ -817,7 +854,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     yield "data: [DONE]\n\n"
                     break
                 else:
-                    err = sse({"error": {"message": payload, "type": "upstream_error"}})
+                    err = sse({"error": payload})
                     yield err
                     yield "data: [DONE]\n\n"
                     break
