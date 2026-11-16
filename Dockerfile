@@ -7,8 +7,7 @@ COPY main.py agent_protocol.py ./
 
 ENV HEADLESS=true \
     PROFILE_DIR=/data/profile \
-    PORT=8080 \
-    COOKIES_FILE=/secrets/cookies.json
+    PORT=8080
 
 RUN mkdir -p /data/profile && chown -R pwuser:pwuser /data
 USER pwuser

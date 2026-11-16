@@ -1,4 +1,4 @@
-# Isolated headful Chrome candidate. Not used by the production CI workflow.
+# Dedicated production Chrome runtime. Built/released separately from the bridge.
 FROM mcr.microsoft.com/playwright/python:v1.55.0-noble
 USER root
 RUN apt-get update \

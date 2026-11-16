@@ -1,0 +1,12 @@
+# Default deny: profiles, credentials, logs, Git and future files stay out.
+**
+!Dockerfile
+!Dockerfile.browser
+!requirements.txt
+!main.py
+!agent_protocol.py
+!scripts/
+scripts/**
+!scripts/browser-entrypoint.sh
+!scripts/browser_runtime.py
+!scripts/browser_probe.py

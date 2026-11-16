@@ -29,6 +29,9 @@ jobs:
       - name: Configure Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Verify Docker build context allowlist
+        run: bash scripts/check-build-context.sh
+
       - name: Log in to Harbor
         uses: docker/login-action@v3
         with:
@@ -43,6 +46,11 @@ jobs:
           context: .
           push: true
           tags: harbor.socrat.alchemmist.xyz/homelab/venice-api:${{ github.sha }}
+
+      - name: Bridge image import smoke test
+        env:
+          IMAGE: harbor.socrat.alchemmist.xyz/homelab/venice-api@${{ steps.image.outputs.digest }}
+        run: docker run --rm --entrypoint python "$IMAGE" -c 'import main, agent_protocol; print("Bridge image imports OK")'
 
       - name: Deploy to Socrat
         uses: alchemmist/deploy-to-socrat@v1

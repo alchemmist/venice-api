@@ -90,3 +90,35 @@ errors: two reads, failing unittest, edit, passing unittest, write a JSON fixtur
 with quotes/backslashes/newline, read back, complete final Markdown report. This
 is not yet extended-soak evidence. The failed intermediate releases are retained
 here deliberately rather than described as successful acceptance.
+
+
+## Hardening: explicit history and budget policies
+
+The root [README](../README.md) is the environment/build contract. The bridge image
+no longer sets COOKIES_FILE; import is explicit standalone-only, never implicit
+from the owner's home. Standalone profiles default outside the checkout under
+XDG_DATA_HOME or ~/.local/share; existing profiles are not moved/deleted. Production
+Chrome's PVC/CDP path and operator/egress secret wiring are unchanged.
+
+Incoming history now checks function-call shape, nonempty names/IDs, argument
+JSON objects, role placement, non-null non-assistant content and matching ordered
+results. Assistant text plus tool calls is legal. Historical arguments are checked
+against current schemas, but mismatches/removed tools are annotated in
+history_validation rather than rejected: an errored attempt or a changed schema
+must remain replayable. New calls still must satisfy current declarations and
+schema. No historical call is executed by this adapter.
+
+Recursive duplicate-key and nonfinite checks also cover scientific overflow
+(1e999), and native nonfinite values in schema/message extras. Over-budget agent
+requests return a typed OpenAI HTTP400 context_length_exceeded before browser
+submission or SSE headers, with safe byte accounting and largest-message indices/
+roles/sizes. No text/paths/arguments/IDs are echoed and no results are silently
+trimmed. Schema overhead that cannot fit even with empty history gets distinct
+reduce-enabled-tools guidance. This is an adapter byte budget, not a model token
+limit. Synthetic boundary, Unicode, history-error replay and privacy tests cover
+these behaviors.
+
+The shared .dockerignore is an explicit default-deny context allowlist. CI audits
+it using real BuildKit against ONLY staged runtime files and synthetic private
+canaries, then checks bridge imports in the published image before GitOps deploy.
+The operator's real profile/debug files are never staged by that audit.

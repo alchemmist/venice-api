@@ -1,5 +1,10 @@
 # Venice bridge: infrastructure audit
 
+> **Historical snapshot, not current production.** The Mac-dependent runtime below
+> has been retired. Start with [README](../README.md) and the canonical homelab
+> `llm-wiki/venice-api.md` runbook. Do not replay the old architecture or interpret
+> its findings as fresh runtime observations.
+
 ## Scope
 
 Read-only runtime inspection; no deployment, restart, credential creation or paid inference. Consulted homelab AGENTS.md, llm-wiki/context.md, README.md, network-access.md, ssh-user.md, docs/mac-private-ssh.md and vpn-mesh-runtime-20261110.md. Historical acceptance is not current health evidence.

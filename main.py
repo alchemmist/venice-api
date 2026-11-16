@@ -50,7 +50,7 @@ import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
-from agent_protocol import AgentProtocol, ProtocolError
+from agent_protocol import AgentProtocol, ProtocolError, PromptBudgetError
 from playwright.async_api import BrowserContext, Page, async_playwright
 
 # --------------------------------------------------------------------------- #
@@ -68,7 +68,11 @@ AGENT_PATH   = os.getenv("VENICE_AGENT_PATH", "/chat/agent")
 AGENT_URL    = BASE_URL + AGENT_PATH
 
 HEADLESS     = _env_bool("HEADLESS", True)
-PROFILE_DIR  = str(Path(os.getenv("PROFILE_DIR", "./venice_profile")).expanduser().resolve())
+DATA_HOME = Path(os.getenv("XDG_DATA_HOME", "").strip() or str(Path.home() / ".local/share")).expanduser()
+if not DATA_HOME.is_absolute():
+    DATA_HOME = Path.home() / ".local/share"
+DEFAULT_PROFILE_DIR = DATA_HOME / "venice-api/profile"
+PROFILE_DIR  = str(Path(os.getenv("PROFILE_DIR", "").strip() or str(DEFAULT_PROFILE_DIR)).expanduser().resolve())
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "").strip() or None
 CHROME_PROFILE = os.getenv("CHROME_PROFILE", "").strip()
 CHROME_USER_DATA = os.getenv(
@@ -252,7 +256,9 @@ class BrowserSession:
             log.info("Подключен Chrome по CDP %s", cdp)
             return
         user_data_dir, profile_dir = _chrome_profile()
-        Path(user_data_dir).mkdir(parents=True, exist_ok=True)
+        Path(user_data_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not profile_dir:
+            os.chmod(user_data_dir, 0o700)
         args = [
             "--disable-blink-features=AutomationControlled",
             "--disable-infobars",
@@ -285,16 +291,21 @@ class BrowserSession:
         if profile_dir:
             log.info("Chrome-профиль %s (%s)", profile_dir, user_data_dir)
         else:
-            await self._apply_saved_cookies()
+            try:
+                await self._apply_saved_cookies()
+            except Exception:
+                await self.close()
+                raise
 
     async def _apply_saved_cookies(self) -> None:
-        path = Path(os.getenv(
-            "COOKIES_FILE",
-            str(Path.home() / "venice-auth" / "incognito-venice-cookies.json"),
-        )).expanduser()
-        if not path.is_file() or self._ctx is None:
-            log.warning("Файл cookies не найден: %s", path)
+        configured = os.getenv("COOKIES_FILE", "").strip()
+        if not configured:
             return
+        path = Path(configured).expanduser()
+        if not path.is_file():
+            raise RuntimeError("Explicit COOKIES_FILE does not exist")
+        if self._ctx is None:
+            raise RuntimeError("Cookie import requires a launched browser context")
         raw = json.loads(path.read_text())
         now = time.time()
         cookies: list[dict[str, Any]] = []
@@ -816,6 +827,8 @@ async def chat_completions(req: ChatCompletionRequest):
             if req.tool_choice not in (None, "auto", "none"):
                 raise ProtocolError("Tool choice requires tools")
             prompt = _flatten(req.messages)
+    except PromptBudgetError as exc:
+        return JSONResponse(status_code=400, content={"error": exc.as_openai_error()})
     except Exception:
         raise HTTPException(400, "Invalid or unsupported agent request (tools, choice, history, schema or budget)") from None
 
