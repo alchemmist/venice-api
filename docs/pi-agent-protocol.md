@@ -23,10 +23,13 @@ attachment and dictation controls, no verified disable-native-tools switch.
   custom/grammar tools and non-text content fail closed. This is NOT a full
   OpenAI API implementation. Sampling/max_tokens remain best-effort/unsupported
   browser semantics, unchanged from plain chat.
-- The complete assistant DOM response must be exactly one top-level native JSON
-  code block, with no prose, quotation or second block. Its code text must be a
-  raw v1 envelope. This preserves JSON escapes that ordinary Markdown prose
-  consumes. No regex extraction, searching embedded commands or automatic repair.
+- The complete assistant source must be a raw v1 envelope, with no fences or
+  extra prose. Only this rendered assistant component's pre-Markdown source is
+  read: bounded React fiber traversal, exact Markdown props markers, identical
+  duplicate sources, stop before parent message state. Missing/ambiguous props
+  fail closed; there is no fallback to lossy DOM text. UI internal changes can
+  break this path and require maintenance. No clipboard or raw network replay.
+  No regex command extraction, Markdown unwrapping or automatic format repair.
   Malformed output produces HTTP502 / typed SSE error, never a tool invocation.
   Duplicate JSON keys and non-finite numbers are rejected.
 - Non-stream returns JSON-string function arguments, bridge-generated call ID and
@@ -67,9 +70,19 @@ model errors (distinct from bridge retries), then stopped after repeated failure
 One independent Venice navigation timeout also occurred before a prompt was sent.
 Do not describe that initial run as successful soak or exactly-once reliability.
 
-The corrected transport requires a sole top-level native code block and reads
-`pre code.textContent` only after strict DOM shape validation, ignoring only the
-native code header. Prose, quoted examples, multiple blocks, and malformed JSON
-remain errors. A live detached-DOM test in server Chrome verifies preservation of
-quotes/newlines/backslashes and rejection of four invalid DOM boundary cases.
-Plain chat extraction remains unchanged.
+An intermediate fenced-code transport preserved escapes but triggered native
+Venice tool processing (`Tool not found`); it FAILED real Pi acceptance. Inline
+code also failed with delimiter collisions/native actions. Neither is accepted.
+
+The final candidate reads the exact source string from this assistant's React
+Markdown component before rendering. It requires raw JSON, no fences, and uses
+an external envelope namespace:
+
+{"pi_bridge":1,"action":"invoke","target":"read","payload":{"path":"fixture.txt"}}
+{"pi_bridge":1,"action":"answer","text":"final Markdown report"}
+
+The final source-based pre-release PoC passed seven real Pi calls with zero model
+errors: two reads, failing unittest, edit, passing unittest, write a JSON fixture
+with quotes/backslashes/newline, read back, complete final Markdown report. This
+is not yet extended-soak evidence. The failed intermediate releases are retained
+here deliberately rather than described as successful acceptance.

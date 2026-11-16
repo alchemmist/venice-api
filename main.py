@@ -143,18 +143,23 @@ SEL_COMPOSER = (
 )
 SEL_SCROLL   = ".minds-chat-scroll-root"
 SEL_ASSISTANT = ".assistant .assistant-content .prose"
-AGENT_CODE_EXTRACTOR = r"""el => {
-    const nodes = [...el.childNodes].filter(n => n.nodeType !== 3 || n.textContent.trim());
-    if (!nodes.length) return '';
-    if (nodes.length !== 1 || nodes[0].nodeType !== 1 ||
-        !nodes[0].classList.contains('codeblock')) return 'INVALID_AGENT_DOM';
-    const block = nodes[0];
-    if (block.querySelectorAll('pre code').length !== 1 ||
-        block.querySelectorAll('.codeblock').length) return 'INVALID_AGENT_DOM';
-    const copy = block.cloneNode(true);
-    copy.querySelectorAll('pre, .code-block-header').forEach(n => n.remove());
-    if (copy.textContent.trim()) return 'INVALID_AGENT_DOM';
-    return block.querySelector('pre code').textContent;
+AGENT_SOURCE_EXTRACTOR = r"""el => {
+    // Source of THIS rendered assistant Markdown component, before Markdown
+    // consumes JSON escapes. No clipboard, network replay or whole-chat state.
+    const keys = Object.keys(el).filter(k => k.startsWith('__reactFiber$'));
+    if (keys.length !== 1) return 'INVALID_AGENT_SOURCE';
+    let fiber = el[keys[0]];
+    const sources = [];
+    for (let i = 0; fiber && i < 16; i++, fiber = fiber.return) {
+        const props = fiber.memoizedProps;
+        if (!props) continue;
+        if (Object.hasOwn(props, 'message')) break;
+        if (Object.hasOwn(props, 'parseIncompleteMarkdown') &&
+            Array.isArray(props.remarkPlugins) && Array.isArray(props.rehypePlugins) &&
+            typeof props.children === 'string') sources.push(props.children);
+    }
+    if (!sources.length || sources.some(s => s !== sources[0])) return 'INVALID_AGENT_SOURCE';
+    return sources[0];
 }"""
 SEL_STOP     = 'button[aria-label*="stop" i], button[data-testid*="stop" i]'
 SEL_SEND     = 'button[aria-label*="send" i], button[data-testid*="send" i]'
@@ -362,9 +367,9 @@ class BrowserSession:
         if await messages.count() <= baseline_count:
             return ""
         if structured:
-            # Markdown prose consumes JSON backslash escapes. Only a sole native
-            # code block preserves the exact bytes; never search a quoted block.
-            return await messages.last.evaluate(AGENT_CODE_EXTRACTOR)
+            # Read the exact source of this assistant Markdown component. Rendered
+            # prose loses escapes; code fences can trigger native Venice tools.
+            return await messages.last.evaluate(AGENT_SOURCE_EXTRACTOR)
         return await messages.last.inner_text()
 
     async def _is_generating(self, page: Page) -> bool:

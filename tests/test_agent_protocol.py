@@ -8,8 +8,8 @@ import main
 TOOLS = [{'type': 'function', 'function': {'name': 'read', 'parameters': {
     'type': 'object', 'properties': {'path': {'type': 'string'}},
     'required': ['path'], 'additionalProperties': False}}}]
-CALL = '{"version":1,"type":"tool_call","name":"read","arguments":{"path":"fixture.txt"}}'
-FINAL = '{"version":1,"type":"final","content":"done"}'
+CALL = '{"pi_bridge":1,"action":"invoke","target":"read","payload":{"path":"fixture.txt"}}'
+FINAL = '{"pi_bridge":1,"action":"answer","text":"done"}'
 
 
 class ProtocolTests(unittest.TestCase):
@@ -26,8 +26,8 @@ class ProtocolTests(unittest.TestCase):
         for text in ['```json\n'+CALL+'\n```', 'Here is '+CALL, CALL[:-1],
                      CALL.replace('"read"', '"bash"'), CALL.replace('"fixture.txt"', '123'),
                      CALL.replace('"path":', '"extra":1,"path":'),
-                     CALL.replace('"version":1', '"version":1,"version":1'),
-                     CALL.replace('"version":1', '"version":true'), 'x'*65537]:
+                     CALL.replace('"pi_bridge":1', '"pi_bridge":1,"pi_bridge":1'),
+                     CALL.replace('"pi_bridge":1', '"pi_bridge":true'), 'x'*65537]:
             with self.subTest(text=text[:90]), self.assertRaises(ProtocolError):
                 self.protocol().decode(text)
 
@@ -126,7 +126,7 @@ class ResponseTests(unittest.IsolatedAsyncioTestCase):
                 messages=[{'role':'user','content':'hello'}], tools=TOOLS, stream=True))
             data = ''.join([x async for x in r.body_iterator])
             self.assertIn('"content": "done"', data)
-            self.assertNotIn('"version"', data)
+            self.assertNotIn('"pi_bridge"', data)
             self.assertIn('"finish_reason": "stop"', data)
 
     async def test_invalid_input_never_reaches_browser(self):
@@ -137,3 +137,27 @@ class ResponseTests(unittest.IsolatedAsyncioTestCase):
                     tools=[{'type':'custom','name':'bash'}]))
             self.assertEqual(exc.exception.status_code, 400)
             complete.assert_not_called()
+
+
+class AssistantSourceTests(unittest.TestCase):
+    def test_source_is_lossless_bounded_and_fail_closed(self):
+        import shutil
+        import subprocess
+        if not shutil.which('node'):
+            self.skipTest('Node needed to evaluate the browser JS extractor')
+        script = r'''const extract = EXTRACTOR;
+const raw = JSON.stringify({pi_bridge:1,action:'invoke',target:'write',payload:{content:'{"x":"y"}\nC:\\tmp\\f `inline` ```code```'}});
+const md = s => ({memoizedProps:{parseIncompleteMarkdown:true,remarkPlugins:[],rehypePlugins:[],children:s}});
+const el = f => ({'__reactFiber$fixture':f});
+const a = md(raw); a.return=md(raw);
+if(extract(el(a))!==raw) throw Error('source damaged');
+const b = md(raw); b.return=md('other');
+if(extract(el(b))!=='INVALID_AGENT_SOURCE') throw Error('ambiguous accepted');
+if(extract({})!=='INVALID_AGENT_SOURCE') throw Error('missing accepted');
+const c = {memoizedProps:{message:{}},return:md(raw)};
+if(extract(el(c))!=='INVALID_AGENT_SOURCE') throw Error('crossed message boundary');
+let d=md(raw); for(let i=0;i<17;i++)d={return:d};
+if(extract(el(d))!=='INVALID_AGENT_SOURCE') throw Error('unbounded traversal');
+'''.replace('EXTRACTOR', main.AGENT_SOURCE_EXTRACTOR)
+        result = subprocess.run(['node', '-e', script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
