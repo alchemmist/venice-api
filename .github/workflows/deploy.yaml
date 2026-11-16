@@ -12,6 +12,8 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      DOCKER_CONFIG: ${{ runner.temp }}/venice-registry-auth
     concurrency:
       group: venice-api-release
       cancel-in-progress: false
@@ -34,13 +36,28 @@ jobs:
         timeout-minutes: 5
         run: bash scripts/check-build-context.sh
 
-      - name: Log in to Harbor
-        timeout-minutes: 2
-        uses: docker/login-action@v3
-        with:
-          registry: harbor.socrat.alchemmist.xyz
-          username: ${{ secrets.HARBOR_USERNAME }}
-          password: ${{ secrets.HARBOR_PASSWORD }}
+      - name: Configure ephemeral Harbor credentials
+        env:
+          REGISTRY_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          python - <<'PYCODE'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          path = Path(os.environ["DOCKER_CONFIG"])
+          path.mkdir(mode=0o700, parents=True, exist_ok=True)
+          path.chmod(0o700)
+          username = os.environ["REGISTRY_USERNAME"]
+          password = os.environ["REGISTRY_PASSWORD"]
+          if not username or not password:
+              raise SystemExit("Registry credentials are missing")
+          auth = base64.b64encode((username + ":" + password).encode()).decode()
+          fd = os.open(path / "config.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w") as stream:
+              json.dump({"auths": {"harbor.socrat.alchemmist.xyz": {"auth": auth}}}, stream)
+          PYCODE
 
       - name: Build and push
         timeout-minutes: 20
@@ -57,6 +74,10 @@ jobs:
         env:
           IMAGE: harbor.socrat.alchemmist.xyz/homelab/venice-api:${{ github.sha }}
         run: docker run --rm --pull=never --entrypoint python "$IMAGE" -c 'import main, agent_protocol; print("Bridge image imports OK")'
+
+      - name: Remove ephemeral registry credentials
+        if: always()
+        run: rm -f "$DOCKER_CONFIG/config.json"
 
       - name: Deploy to Socrat
         uses: alchemmist/deploy-to-socrat@v1

@@ -1,4 +1,7 @@
 import os
+import base64
+import json
+import textwrap
 from pathlib import Path
 import shlex
 import subprocess
@@ -49,6 +52,26 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('image_version: ${{ steps.image.outputs.digest }}', workflow)
         self.assertLess(workflow.index('Bridge image import smoke test'),
                         workflow.index('name: Deploy to Socrat'))
+
+    def test_ci_registry_credentials_are_private_ephemeral_and_never_printed(self):
+        workflow = (ROOT / '.github/workflows/deploy.yaml').read_text()
+        self.assertNotIn('docker/login-action', workflow)
+        self.assertIn('DOCKER_CONFIG: ${{ runner.temp }}/venice-registry-auth', workflow)
+        self.assertIn('if: always()\n        run: rm -f "$DOCKER_CONFIG/config.json"', workflow)
+        script = textwrap.dedent(workflow.split("python - <<'PYCODE'\n", 1)[1].split('          PYCODE', 1)[0])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'private-auth'
+            env = dict(os.environ, DOCKER_CONFIG=str(path), REGISTRY_USERNAME='synthetic-user', REGISTRY_PASSWORD='synthetic-private-canary')
+            result = subprocess.run([sys.executable, '-c', script], env=env, capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout + result.stderr, '')
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+            config = path / 'config.json'
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(config.read_text()), {'auths': {'harbor.socrat.alchemmist.xyz': {'auth': base64.b64encode(b'synthetic-user:synthetic-private-canary').decode()}}})
+            again = subprocess.run([sys.executable, '-c', script], env=env, capture_output=True, text=True)
+            self.assertNotEqual(again.returncode, 0)
+            self.assertNotIn('synthetic-private-canary', again.stderr)
+            self.assertNotIn('private-auth', CONTEXT_FILES)
 
     def test_readme_documents_mode_specific_environment(self):
         readme = (ROOT / 'README.md').read_text()

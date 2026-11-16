@@ -72,6 +72,13 @@ Current operations/acceptance: `homelab/llm-wiki/venice-api.md`. The older
 [initial infrastructure audit](docs/infrastructure-audit.md) is historical and
 must not be used as the current deployment contract.
 
+CI creates a dedicated runner-temp Docker auth config (directory0700/file0600)
+from its existing Harbor secrets without printing them. BuildKit performs actual
+registry authentication during push; a separate daemon login preflight is not
+required. The config is removed with `always()`, is outside the build context,
+and is never part of an image. Push, local image smoke and immutable-digest
+GitOps deployment remain mandatory; registry failures never authorize deployment.
+
 ## Run and test
 
 Python3.12 is used in CI. From an isolated virtual environment:
