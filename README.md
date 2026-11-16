@@ -183,8 +183,10 @@ bash scripts/check-build-context.sh
 The check stages only allowed source files and synthetic secret/profile/debug
 canaries, then uses real BuildKit matching plus a scratch-image context export.
 It never stages your real browser profile or secrets for its audit. CI requires
-exactly the eight allowed files before publishing, then imports the actual bridge
-image before GitOps deployment. Both recipes' COPY dependencies are also unit-tested.
+exactly the eight allowed files before publishing, then imports the bridge
+image from the SAME BuildKit result loaded locally (`--pull=never`) before GitOps
+deployment of the published immutable digest. This avoids an extra registry
+connection just to run the smoke test. Both recipes' COPY dependencies are also unit-tested.
 Adding a runtime dependency requires updating the allowlist and tests deliberately.
 
 Keep keys/cookies/profile archives and evidence in private operator custody,

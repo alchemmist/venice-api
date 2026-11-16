@@ -11,6 +11,7 @@ jobs:
   publish-and-deploy:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     concurrency:
       group: venice-api-release
       cancel-in-progress: false
@@ -30,9 +31,11 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Verify Docker build context allowlist
+        timeout-minutes: 5
         run: bash scripts/check-build-context.sh
 
       - name: Log in to Harbor
+        timeout-minutes: 2
         uses: docker/login-action@v3
         with:
           registry: harbor.socrat.alchemmist.xyz
@@ -40,17 +43,20 @@ jobs:
           password: ${{ secrets.HARBOR_PASSWORD }}
 
       - name: Build and push
+        timeout-minutes: 20
         id: image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          load: true
           tags: harbor.socrat.alchemmist.xyz/homelab/venice-api:${{ github.sha }}
 
       - name: Bridge image import smoke test
+        timeout-minutes: 2
         env:
-          IMAGE: harbor.socrat.alchemmist.xyz/homelab/venice-api@${{ steps.image.outputs.digest }}
-        run: docker run --rm --entrypoint python "$IMAGE" -c 'import main, agent_protocol; print("Bridge image imports OK")'
+          IMAGE: harbor.socrat.alchemmist.xyz/homelab/venice-api:${{ github.sha }}
+        run: docker run --rm --pull=never --entrypoint python "$IMAGE" -c 'import main, agent_protocol; print("Bridge image imports OK")'
 
       - name: Deploy to Socrat
         uses: alchemmist/deploy-to-socrat@v1

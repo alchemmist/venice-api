@@ -44,6 +44,9 @@ class PackagingTests(unittest.TestCase):
         workflow = (ROOT / '.github/workflows/deploy.yaml').read_text()
         self.assertLess(workflow.index('run: bash scripts/check-build-context.sh'),
                         workflow.index('uses: docker/build-push-action'))
+        self.assertIn('load: true', workflow)
+        self.assertIn('docker run --rm --pull=never', workflow)
+        self.assertIn('image_version: ${{ steps.image.outputs.digest }}', workflow)
         self.assertLess(workflow.index('Bridge image import smoke test'),
                         workflow.index('name: Deploy to Socrat'))
 
