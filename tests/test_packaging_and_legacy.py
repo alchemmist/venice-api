@@ -56,8 +56,10 @@ class PackagingTests(unittest.TestCase):
     def test_ci_registry_credentials_are_private_ephemeral_and_never_printed(self):
         workflow = (ROOT / '.github/workflows/deploy.yaml').read_text()
         self.assertNotIn('docker/login-action', workflow)
-        self.assertIn('DOCKER_CONFIG: ${{ runner.temp }}/venice-registry-auth', workflow)
-        self.assertIn('if: always()\n        run: rm -f "$DOCKER_CONFIG/config.json"', workflow)
+        self.assertNotIn('${{ runner.temp }}', workflow)
+        self.assertLess(workflow.index('Select ephemeral Docker config'), workflow.index('Configure Docker Buildx'))
+        self.assertIn('DOCKER_CONFIG=$RUNNER_TEMP/venice-registry-auth', workflow)
+        self.assertIn('if: always()\n        run: rm -f "$RUNNER_TEMP/venice-registry-auth/config.json"', workflow)
         script = textwrap.dedent(workflow.split("python - <<'PYCODE'\n", 1)[1].split('          PYCODE', 1)[0])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'private-auth'
