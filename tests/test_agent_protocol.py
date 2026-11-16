@@ -161,12 +161,12 @@ const el = f => {
 };
 const a = md('transformed wrong'); a.return=msg(raw);
 if(extract(el(a))!==raw) throw Error('source damaged');
-if(extract(el(md(raw)))!=='INVALID_AGENT_SOURCE') throw Error('accepted transformed fallback');
-if(extract({})!=='INVALID_AGENT_SOURCE') throw Error('missing accepted');
+if(extract(el(md(raw)))!==null) throw Error('accepted transformed fallback');
+if(extract({})!==null) throw Error('missing accepted');
 const b=msg(raw); b.memoizedProps.message.role='user'; b.return=msg(raw);
-if(extract(el(b))!=='INVALID_AGENT_SOURCE') throw Error('crossed message boundary');
+if(extract(el(b))!==null) throw Error('crossed message boundary');
 let d=msg(raw); for(let i=0;i<49;i++)d={return:d};
-if(extract(el(d))!=='INVALID_AGENT_SOURCE') throw Error('unbounded traversal');
+if(extract(el(d))!==null) throw Error('unbounded traversal');
 const original=JSON.stringify({pi_bridge:1,action:'invoke',target:'bash',payload:{command:'echo "$? ${PIPESTATUS[0]}"; printf "\\n"'}});
 const math=md(original.replaceAll('$','\$')); math.return=msg(original);
 if(extract(el(math))!==original) throw Error('LaTeX dollar preprocessing leaked into protocol');
@@ -177,9 +177,9 @@ old.return=root; old.alternate=fresh; fresh.alternate=old;
 node['__reactFiber$fixture']=staleHost;
 if(extract(node)!==raw) throw Error('stale alternate was read');
 const orphan=el(msg(raw)); orphan.isConnected=false;
-if(extract(orphan)!=='INVALID_AGENT_SOURCE') throw Error('detached accepted');
+if(extract(orphan)!==null) throw Error('detached accepted');
 const unreachable=el(msg(raw)); unreachable['__reactFiber$fixture'].return.return.child=null;
-if(extract(unreachable)!=='INVALID_AGENT_SOURCE') throw Error('uncommitted host accepted');
+if(extract(unreachable)!==null) throw Error('uncommitted host accepted');
 '''.replace('EXTRACTOR', main.AGENT_SOURCE_EXTRACTOR)
         result = subprocess.run(['node', '-e', script], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)

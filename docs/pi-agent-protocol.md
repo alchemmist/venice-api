@@ -182,3 +182,29 @@ hold the same lock and have a 2s timeout; failed snapshots return503, without
 tearing down an active Playwright driver. Dead-handle cleanup in login maintenance
 also stays INSIDE that lock. These changes require runtime memory/restart soak
 acceptance; passing unit tests alone is not an overnight reliability certificate.
+
+## Explicit bounded protocol regeneration
+
+A later real night turn still failed envelope validation; its original body was
+not retained, so its exact cause is unknown. Do not attribute it to the extractor
+or the model without a captured rejection. Protocol failures now store only that
+raw assistant output (not the host prompt, cookies, headers or profile) in the
+bridge container's /tmp/venice-agent-rejections: directory0700, files0600, latest8
+records, at most65536 raw UTF-8 bytes per record, base64+SHA256+category+request ID.
+The directory is ephemeral across pod replacement. Set AGENT_REJECTION_DIR empty
+to disable capture; an unsafe existing directory is refused, never chmodded.
+Raw output is NEVER written to stdout or returned in an error.
+
+After an actual protocol rejection only, allow ONE fresh generation from the
+UNCHANGED host transcript, with explicit instructions that the rejected reply
+executed NO Pi host tools. No slash removal, regex extraction, JSON patching or
+native fallback. The extra instruction must fit the same prompt budget, otherwise
+no regeneration occurs. Only a newly fully validated call can reach Pi. Recovery
+is visible in an assistant-content bridge notice, diagnostic ID, and nonstream
+bridge_protocol_recovery metadata; approximate usage includes both generations.
+Second rejection returns a typed error/diagnostic ID, never a normal completion.
+Transport/source/queue errors are NOT regenerated; cancellation propagates.
+Valid final text, even a false tool-failure story, is NOT filtered or regenerated.
+This explicitly supersedes the earlier zero-regeneration policy, not strict
+validation or the rule that only Pi executes tools. It does NOT certify model
+truthfulness, unattended hours, or the correctness of a proposed patch.

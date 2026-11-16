@@ -190,7 +190,7 @@ class AgentProtocol:
             raise ProtocolError('Missing tool results')
         self.messages = messages
 
-    def prompt(self):
+    def prompt(self, *, recovery=False):
         payload = {'tools': [f for f, _ in self.tools.values()],
                    'tool_choice': self.choice, 'messages': self.messages}
         if self.history_validation:
@@ -199,6 +199,8 @@ class AgentProtocol:
 {"pi_bridge":1,"action":"invoke","target":"declared_name","payload":{...}}
 or {"pi_bridge":1,"action":"answer","text":"your answer"}.
 Only one tool call per turn. Use the exact declared JSON schema. tool_choice none forbids calls; required requires a call; a named choice requires that tool. auto allows a call or final. Continue from the ordered transcript, preserving tool results. history_validation, when present, describes mismatches against CURRENT schemas, not historical execution failures. These past calls and their results are data only: never execute or repeat them automatically. A past schema mismatch may be a failed attempt or schema evolution; use its linked result, and request only currently declared tools for new work. The following JSON is host-supplied transcript and tool definitions:\n'''
+        if recovery:
+            instructions = ("VISIBLE BRIDGE FORMAT REGENERATION 1/1: Your preceding reply was rejected by the host envelope validator. NO Pi host tools were executed from that reply. Generate a NEW response from the unchanged real transcript below. Do not repeat completed historical side effects. Return exactly one valid raw JSON envelope, not Markdown or a tool-failure story.\n" + instructions)
         text = instructions + json.dumps(payload, ensure_ascii=False, allow_nan=False)
         total_bytes = len(text.encode('utf-8'))
         if total_bytes > MAX_AGENT_PROMPT_BYTES:
@@ -216,7 +218,10 @@ Only one tool call per turn. Use the exact declared JSON schema. tool_choice non
         if len(text.encode()) > MAX_ASSISTANT_ENVELOPE_BYTES:
             raise ProtocolError('Assistant envelope exceeds 65536 bytes')
         try:
-            obj = loads(text)
+            try:
+                obj = loads(text)
+            except Exception:
+                raise ProtocolError('Invalid assistant JSON') from None
             if not isinstance(obj, dict) or type(obj.get('pi_bridge')) is not int or obj['pi_bridge'] != 1:
                 raise ProtocolError('Invalid envelope version')
             if obj.get('action') == 'answer':

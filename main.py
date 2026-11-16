@@ -33,6 +33,9 @@ data-testid / aria-label / href / семантику. Если Venice помен
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import stat
 import contextlib
 import json
 import logging
@@ -148,7 +151,7 @@ SEL_COMPOSER = (
 SEL_SCROLL   = ".minds-chat-scroll-root"
 SEL_ASSISTANT = '.assistant[data-testid="text-chat-message"] .prose'
 AGENT_SOURCE_EXTRACTOR = r"""el => {
-    const invalid = 'INVALID_AGENT_SOURCE';
+    const invalid = null;
     const keys = Object.keys(el).filter(k => k.startsWith('__reactFiber$'));
     if (keys.length !== 1 || !el.isConnected) return invalid;
     let root = el[keys[0]], depth = 0;
@@ -480,7 +483,10 @@ class BrowserSession:
         messages = page.locator(SEL_ASSISTANT)
         if await messages.count() <= baseline_count:
             return ""
-        return await messages.last.evaluate(AGENT_SOURCE_EXTRACTOR)
+        source = await messages.last.evaluate(AGENT_SOURCE_EXTRACTOR)
+        if not isinstance(source, str):
+            raise AgentTransportError("Assistant source extraction failed; no tool call emitted")
+        return source
 
     async def _is_generating(self, page: Page) -> bool:
         try:
@@ -813,6 +819,36 @@ def _flatten(messages: list[ChatMessage]) -> str:
     return "\n\n".join(blocks)
 
 
+def _record_rejection(text: str, category: str, request_id: str, attempt: int) -> Optional[str]:
+    configured = os.getenv("AGENT_REJECTION_DIR", "/tmp/venice-agent-rejections").strip()
+    if not configured:
+        return None
+    try:
+        root = Path(configured)
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = root.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.geteuid():
+            raise OSError("Unsafe diagnostic directory")
+        raw = text.encode("utf-8", errors="surrogatepass")
+        identity = uuid.uuid4().hex
+        path = root / ("rejection-" + identity + ".json")
+        record = {"id": identity, "request_id": request_id, "attempt": attempt,
+                  "category": category, "utf8_bytes": len(raw),
+                  "sha256": hashlib.sha256(raw).hexdigest(), "truncated": len(raw) > 65536,
+                  "raw_utf8_base64": base64.b64encode(raw[:65536]).decode("ascii")}
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(record, output)
+        paths = sorted(root.glob("rejection-*.json"), key=lambda item: item.stat().st_mtime_ns)
+        for old in paths[:-8]:
+            old.unlink()
+        log.warning("Rejected agent response id=%s category=%s attempt=%s", identity, category, attempt)
+        return identity
+    except Exception:
+        log.warning("Protected rejection diagnostic unavailable; raw response not logged")
+        return None
+
+
 def _usage(prompt: str, completion: str) -> dict[str, int]:
     pt = max(1, len(prompt) // 4)
     ct = max(1, len(completion) // 4)
@@ -953,14 +989,49 @@ async def chat_completions(req: ChatCompletionRequest):
     cid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
+    async def generate_decoded(on_delta=None, on_recovery=None):
+        input_text = prompt
+        outputs = []
+        recovery = None
+        for attempt in range(2):
+            text = await SESSION.complete(input_text, **({"on_delta": on_delta} if on_delta else {}),
+                                          **({"structured": True} if protocol else {}))
+            outputs.append(text)
+            try:
+                message, finish = decode(text)
+            except ProtocolError as exc:
+                category = str(exc)
+                diagnostic_id = _record_rejection(text, category, cid, attempt + 1)
+                exc.diagnostic_id = diagnostic_id
+                exc.category = category
+                if not protocol or attempt == 1:
+                    raise
+                try:
+                    input_text = protocol.prompt(recovery=True)
+                except PromptBudgetError:
+                    raise exc from None
+                recovery = {"attempts": 1, "diagnostic_id": diagnostic_id, "category": category}
+                notice = f"[bridge: protocol regeneration 1/1; diagnostic_id={diagnostic_id or 'unavailable'}; rejected reply executed NO host tools]\n"
+                if on_recovery:
+                    await on_recovery(notice)
+                continue
+            if recovery:
+                message["bridge_protocol_recovery"] = recovery
+                if not on_recovery:
+                    message["content"] = notice + (message.get("content") or "")
+            used_prompt = prompt + input_text if recovery else prompt
+            return message, finish, _usage(used_prompt, "".join(outputs))
+        raise AssertionError("Unreachable regeneration state")
+
     if not req.stream:
         try:
-            text = await SESSION.complete(prompt, **({"structured": True} if protocol else {}))
-            message, finish = decode(text)
+            message, finish, usage = await generate_decoded()
         except AgentTransportError as exc:
             raise HTTPException(502, str(exc)) from None
-        except ProtocolError:
-            raise HTTPException(502, "Invalid assistant agent envelope; no tool call emitted") from None
+        except ProtocolError as exc:
+            ref = getattr(exc, "diagnostic_id", None)
+            raise HTTPException(502, "Invalid assistant agent envelope; no tool call emitted" +
+                                (f"; diagnostic_id={ref}" if ref else "")) from None
         except BrowserBusyError as exc:
             raise HTTPException(429, str(exc), headers={"Retry-After": "5"}) from None
         except Exception as exc:  # noqa: BLE001
@@ -979,7 +1050,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     "finish_reason": finish,
                 }
             ],
-            "usage": _usage(prompt, text),
+            "usage": usage,
         }
 
     queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
@@ -990,12 +1061,15 @@ async def chat_completions(req: ChatCompletionRequest):
                 await queue.put(("delta", delta))
 
         try:
-            text = await SESSION.complete(prompt, on_delta, **({"structured": True} if protocol else {}))
-            await queue.put(("final", (*decode(text), _usage(prompt, text))))
+            async def on_recovery(notice):
+                await queue.put(("notice", notice))
+            await queue.put(("final", await generate_decoded(on_delta, on_recovery)))
         except AgentTransportError as exc:
             await queue.put(("error", {"message": str(exc), "type": "upstream_agent_transport_error"}))
-        except ProtocolError:
-            await queue.put(("error", {"message": "Invalid assistant agent envelope; no tool call emitted", "type": "upstream_protocol_error"}))
+        except ProtocolError as exc:
+            await queue.put(("error", {"message": "Invalid assistant agent envelope; no tool call emitted", "type": "upstream_protocol_error",
+                                       "diagnostic_id": getattr(exc, "diagnostic_id", None),
+                                       "category": getattr(exc, "category", "validation")}))
         except BrowserBusyError as exc:
             await queue.put(("error", {"message": str(exc), "type": "rate_limit_error", "code": 429}))
         except Exception as exc:  # noqa: BLE001
@@ -1027,7 +1101,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 except asyncio.TimeoutError:
                     yield ": keep-alive\n\n"
                     continue
-                if kind == "delta":
+                if kind in ("delta", "notice"):
                     yield chunk({"content": payload})
                 elif kind == "final":
                     message, finish, usage = payload
