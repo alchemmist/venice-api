@@ -34,6 +34,25 @@ class BridgeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await session._answer(page, 0), "assistant\nprivate\nDeepSeek is a model\nsources")
         page.locator.assert_called_with(bridge.SEL_ASSISTANT)
 
+    async def test_stream_buffers_dom_rewrites(self):
+        session = bridge.BrowserSession()
+        page = MagicMock()
+        page.locator.return_value.count = AsyncMock(return_value=0)
+        page.locator.return_value.first.click = AsyncMock()
+        page.locator.return_value.first.fill = AsyncMock()
+        page.keyboard.insert_text = AsyncMock()
+        page.keyboard.press = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        session._page_or_start = AsyncMock(return_value=page)
+        session._prepare = AsyncMock()
+        session._answer = AsyncMock(side_effect=["partial wrong", "correct final", "correct final"])
+        session._is_generating = AsyncMock(return_value=False)
+        session._shot = AsyncMock()
+        on_delta = AsyncMock()
+        with patch.object(bridge, "STABLE_SEC", -1), patch.object(bridge.asyncio, "sleep", AsyncMock()):
+            self.assertEqual(await session.complete("test", on_delta), "correct final")
+        on_delta.assert_awaited_once_with("correct final")
+
     async def test_existing_messages_not_returned(self):
         page = MagicMock()
         page.locator.return_value.count = AsyncMock(return_value=1)

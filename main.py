@@ -527,9 +527,8 @@ class BrowserSession:
             # --- читаем поток ---
             deadline = time.monotonic() + GEN_TIMEOUT
             last_change = time.monotonic()
-            emitted = answer if (on_delta and answer) else ""
-            if emitted and on_delta:
-                await on_delta(emitted)
+            # The web UI can rewrite partial Markdown. Buffer until completion
+            # rather than emitting an irreversible, corrupted SSE prefix.
 
             while time.monotonic() < deadline:
                 await asyncio.sleep(0.25)
@@ -538,12 +537,6 @@ class BrowserSession:
                 if current != answer:
                     answer = current
                     last_change = time.monotonic()
-                    if on_delta and not current.startswith(emitted):
-                        raise RuntimeError("Upstream rewrote streamed content")
-                    if on_delta and len(current) > len(emitted):
-                        delta = current[len(emitted):]
-                        emitted = current
-                        await on_delta(delta)
                     continue
 
                 idle = time.monotonic() - last_change
@@ -555,7 +548,10 @@ class BrowserSession:
             await self._shot(page, "done")
             if not answer.strip():
                 raise RuntimeError("Model returned no assistant content")
-            return answer.strip()
+            answer = answer.strip()
+            if on_delta:
+                await on_delta(answer)
+            return answer
 
 
 def _clean_answer(raw: str, baseline: str, prompt: str) -> str:
@@ -693,6 +689,7 @@ async def root() -> dict[str, Any]:
         "service": "venice-agentic-bridge",
         "model": MODEL_ID,
         "agent_url": AGENT_URL,
+        "streaming": "buffered_sse",
         "endpoints": ["/v1/models", "/v1/chat/completions", "/healthz", "/docs", "/openapi.json"],
     }
 
@@ -797,7 +794,11 @@ async def chat_completions(req: ChatCompletionRequest):
         yield chunk({"role": "assistant", "content": ""})
         try:
             while True:
-                kind, payload = await queue.get()
+                try:
+                    kind, payload = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
                 if kind == "delta":
                     yield chunk({"content": payload})
                 elif kind == "final":
