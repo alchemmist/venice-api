@@ -310,6 +310,7 @@ class BrowserSession:
         self._lock = asyncio.Lock()
         self._cdp = False
         self._pending = 0
+        self._authenticated = False
 
     @asynccontextmanager
     async def request_slot(self):
@@ -431,8 +432,15 @@ class BrowserSession:
             await self._ctx.add_cookies(cookies)
             log.info("Подставлено cookies: %s", len(cookies))
 
-    async def _page_or_start(self) -> Page:
+    async def _page_or_start(self, *, recycle: bool = False) -> Page:
         if self._page and not self._page.is_closed() and urlsplit(self._page.url).hostname == urlsplit(BASE_URL).hostname:
+            if not recycle or not self._authenticated:
+                return self._page
+            assert self._ctx is not None
+            old = self._page
+            await old.close()
+            self._page = None
+            self._page = await self._ctx.new_page()
             return self._page
         if self._ctx is None:
             await self._launch()
@@ -453,6 +461,7 @@ class BrowserSession:
             if self._pw:
                 await self._pw.stop()
         self._ctx = self._page = self._pw = None
+        self._authenticated = False
 
     # ------------------------- утилиты страницы ---------------------------- #
 
@@ -509,8 +518,11 @@ class BrowserSession:
             timeout=NAV_TIMEOUT * 1000,
         )
         account = page.locator('[data-testid="account-menu"]')
-        if await account.count() and "Venice Guest" not in await account.inner_text():
+        text = await account.inner_text() if await account.count() else ""
+        if text.strip() and "Venice Guest" not in text:
+            self._authenticated = True
             return
+        self._authenticated = False
         if not AUTO_GOOGLE_LOGIN:
             raise RuntimeError("Venice login required")
         await page.goto(BASE_URL + "/sign-in", wait_until="domcontentloaded", timeout=NAV_TIMEOUT * 1000)
@@ -528,6 +540,7 @@ class BrowserSession:
         except Exception:
             raise RuntimeError("Google session requires operator verification; passwords/MFA are not automated") from None
         await page.goto(AGENT_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT * 1000)
+        self._authenticated = True
 
     async def _new_chat(self, page: Page) -> None:
         await page.goto(AGENT_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT * 1000)
@@ -649,7 +662,7 @@ class BrowserSession:
         structured: bool = False,
     ) -> str:
         async with self.request_slot():
-            page = await self._page_or_start()
+            page = await self._page_or_start(recycle=NEW_CHAT_PER_REQUEST)
             try:
                 await self._prepare(page)
             except Exception:
@@ -824,17 +837,16 @@ async def lifespan(_: FastAPI):
     log.info("Сервис на http://%s:%s | модель: %s | agentic: %s", HOST, PORT, MODEL_ID, AGENT_URL)
     async def maintain_login():
         while True:
-            try:
-                async with SESSION._lock:
+            async with SESSION._lock:
+                try:
                     page = await SESSION._page_or_start()
                     if urlsplit(page.url).hostname != urlsplit(BASE_URL).hostname:
                         await page.goto(AGENT_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT * 1000)
                     await SESSION._ensure_login(page)
-            except Exception:
-                log.warning("Browser authentication is not ready; retrying without password/MFA automation")
-                # Release stale CDP handles only when the transport has died.
-                if SESSION._page is None or SESSION._page.is_closed():
-                    await SESSION.close()
+                except Exception:
+                    log.warning("Browser authentication is not ready; retrying without password/MFA automation")
+                    if SESSION._page is None or SESSION._page.is_closed():
+                        await SESSION.close()
             await asyncio.sleep(15)
 
     task = asyncio.create_task(maintain_login()) if os.getenv("CDP_URL", "").strip() else None
@@ -873,15 +885,23 @@ async def root() -> dict[str, Any]:
 
 @app.get("/healthz", summary="Состояние браузерной сессии")
 async def healthz() -> JSONResponse:
-    try:
-        page = await SESSION._page_or_start()
-        account = page.locator('[data-testid="account-menu"]')
-        authenticated = bool(await account.count() and "Venice Guest" not in await account.inner_text())
-        return JSONResponse({"ok": authenticated, "authenticated": authenticated},
+    def result(authenticated: bool, busy: bool = False) -> JSONResponse:
+        return JSONResponse({"ok": authenticated, "authenticated": authenticated, "busy": busy},
                             status_code=200 if authenticated else 503)
-    except Exception:
-        await SESSION.close()
-        return JSONResponse({"ok": False, "authenticated": False}, status_code=503)
+    if SESSION._lock.locked():
+        return result(SESSION._authenticated, busy=True)
+    async with SESSION._lock:
+        page = SESSION._page
+        if page is None or page.is_closed():
+            SESSION._authenticated = False
+            return result(False)
+        try:
+            text = await asyncio.wait_for(
+                page.locator('[data-testid="account-menu"]').inner_text(timeout=1500), 2)
+            SESSION._authenticated = bool(text.strip() and "Venice Guest" not in text)
+        except Exception:
+            SESSION._authenticated = False
+        return result(SESSION._authenticated)
 
 
 @app.get("/v1/models", summary="Список доступных моделей", dependencies=[Depends(_auth)])

@@ -164,3 +164,21 @@ night request, four browser replays produced two invalid old-extractor envelopes
 and zero invalid raw-message envelopes. No tools were executed in those replays.
 The matching browser request must finish before any response is released; failed
 requests have explicit transport errors and all listeners/routes are removed.
+
+## Browser lifecycle and probes
+
+A subsequent actual nightly run exposed TWO real Chrome OOM kills at its existing
+3Gi limit (Chrome exit137, bridge zero restarts), causing TargetClosed/API500s.
+Do not attribute those errors to Pi's tool registry or hide them as normal output.
+The exact allocator/leak cause was not established. To bound renderer retention,
+NEW_CHAT_PER_REQUEST now replaces only the bridge-owned authenticated PAGE before
+each request, rather than navigating the same tab indefinitely. The persistent
+context, profile, cookies, Google identity and PVC are retained. Unknown-auth/MFA
+pages are not discarded by this policy; no browser-memory limit was increased.
+
+Health probes never launch or close a shared transport. A busy probe returns the
+last known authenticated state without touching a navigating document. Idle probes
+hold the same lock and have a 2s timeout; failed snapshots return503, without
+tearing down an active Playwright driver. Dead-handle cleanup in login maintenance
+also stays INSIDE that lock. These changes require runtime memory/restart soak
+acceptance; passing unit tests alone is not an overnight reliability certificate.
