@@ -274,7 +274,7 @@ class BrowserSession:
             log.info("Подставлено cookies: %s", len(cookies))
 
     async def _page_or_start(self) -> Page:
-        if self._page and not self._page.is_closed():
+        if self._page and not self._page.is_closed() and urlsplit(self._page.url).hostname == urlsplit(BASE_URL).hostname:
             return self._page
         if self._ctx is None:
             await self._launch()
@@ -649,8 +649,30 @@ async def _auth(authorization: Optional[str] = Header(default=None)) -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     log.info("Сервис на http://%s:%s | модель: %s | agentic: %s", HOST, PORT, MODEL_ID, AGENT_URL)
-    yield
-    await SESSION.close()
+    async def maintain_login():
+        while True:
+            try:
+                async with SESSION._lock:
+                    page = await SESSION._page_or_start()
+                    if urlsplit(page.url).hostname != urlsplit(BASE_URL).hostname:
+                        await page.goto(AGENT_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT * 1000)
+                    await SESSION._ensure_login(page)
+            except Exception:
+                log.warning("Browser authentication is not ready; retrying without password/MFA automation")
+                # Release stale CDP handles only when the transport has died.
+                if SESSION._page is None or SESSION._page.is_closed():
+                    await SESSION.close()
+            await asyncio.sleep(15)
+
+    task = asyncio.create_task(maintain_login()) if os.getenv("CDP_URL", "").strip() else None
+    try:
+        yield
+    finally:
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await SESSION.close()
 
 
 app = FastAPI(
