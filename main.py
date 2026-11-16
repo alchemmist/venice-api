@@ -42,6 +42,7 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Optional
 
@@ -101,9 +102,10 @@ USER_AGENT   = os.getenv("USER_AGENT", "").strip() or None
 # Публичный идентификатор модели, который отдаём наружу
 MODEL_ID     = os.getenv("MODEL_ID", "venice-agentic-deepseek-v4.1-flash-uncensored")
 # Регэксп, которым ловим нужную модель в UI (кнопка выбора и пункт списка)
-MODEL_MATCH  = os.getenv("MODEL_MATCH", r"(deepseek\s*v?4[.\-]?1|flash[\s_\-]*uncensored)")
+MODEL_MATCH  = os.getenv("MODEL_MATCH", r"^deepseek\s+v?4[.\-]1\s+flash\s+uncensored$")
 # Новый чат под каждый запрос (чистая семантика OpenAI, чуть медленнее)
 NEW_CHAT_PER_REQUEST = _env_bool("NEW_CHAT_PER_REQUEST", True)
+AUTO_GOOGLE_LOGIN = _env_bool("AUTO_GOOGLE_LOGIN", True)
 
 API_KEY      = os.getenv("API_KEY", "").strip()
 HOST         = os.getenv("HOST", "127.0.0.1")
@@ -136,6 +138,7 @@ SEL_COMPOSER = (
     'form:has(textarea[name="prompt-textarea"])'
 )
 SEL_SCROLL   = ".minds-chat-scroll-root"
+SEL_ASSISTANT = ".assistant .assistant-content .prose"
 SEL_STOP     = 'button[aria-label*="stop" i], button[data-testid*="stop" i]'
 SEL_SEND     = 'button[aria-label*="send" i], button[data-testid*="send" i]'
 SEL_AGENT_LINK = 'a[href="/chat/agent"], a[href^="/chat/agent?"]'
@@ -277,7 +280,9 @@ class BrowserSession:
             await self._launch()
         assert self._ctx is not None
         pages = [p for p in self._ctx.pages if not p.is_closed()]
-        self._page = pages[0] if pages else await self._ctx.new_page()
+        self._page = next((p for p in pages if urlsplit(p.url).hostname == urlsplit(BASE_URL).hostname), None)
+        if self._page is None:
+            self._page = await self._ctx.new_page()
         return self._page
 
     async def close(self) -> None:
@@ -304,19 +309,11 @@ class BrowserSession:
         except Exception as exc:  # noqa: BLE001
             log.debug("Не смог снять скриншот: %s", exc)
 
-    async def _transcript(self, page: Page) -> str:
-        """Весь текст ленты сообщений (скролл-контейнер)."""
-        try:
-            return await page.evaluate(
-                """(sel) => {
-                    const el = document.querySelector(sel);
-                    if (!el) return '';
-                    return el.innerText || '';
-                }""",
-                SEL_SCROLL,
-            )
-        except Exception:  # noqa: BLE001
+    async def _answer(self, page: Page, baseline_count: int) -> str:
+        messages = page.locator(SEL_ASSISTANT)
+        if await messages.count() <= baseline_count:
             return ""
+        return await messages.last.inner_text()
 
     async def _is_generating(self, page: Page) -> bool:
         try:
@@ -347,8 +344,36 @@ class BrowserSession:
 
     # ------------------------- подготовка ---------------------------------- #
 
+    async def _ensure_login(self, page: Page) -> None:
+        # Reuse the persistent Google session; never enter passwords or MFA.
+        await page.wait_for_selector(
+            '[data-testid="account-menu"], button:has-text("Venice Guest"), button[aria-label="Continue with Google"]',
+            timeout=NAV_TIMEOUT * 1000,
+        )
+        account = page.locator('[data-testid="account-menu"]')
+        if await account.count() and "Venice Guest" not in await account.inner_text():
+            return
+        if not AUTO_GOOGLE_LOGIN:
+            raise RuntimeError("Venice login required")
+        await page.goto(BASE_URL + "/sign-in", wait_until="domcontentloaded", timeout=NAV_TIMEOUT * 1000)
+        await page.get_by_role("button", name="Continue with Google", exact=True).click(timeout=30_000)
+        # A remembered single Google account normally returns without interaction.
+        # Do not choose identities or accept new consent blindly.
+        try:
+            await page.wait_for_url(lambda url: urlsplit(str(url)).hostname == urlsplit(BASE_URL).hostname
+                                    and "/sign-in" not in urlsplit(str(url)).path,
+                                    timeout=45_000)
+            await page.wait_for_function("""() => {
+                const el = document.querySelector('[data-testid="account-menu"]');
+                return el && el.innerText.trim() && !el.innerText.includes("Venice Guest");
+            }""", timeout=30_000)
+        except Exception:
+            raise RuntimeError("Google session requires operator verification; passwords/MFA are not automated") from None
+        await page.goto(AGENT_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT * 1000)
+
     async def _new_chat(self, page: Page) -> None:
         await page.goto(AGENT_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT * 1000)
+        await self._ensure_login(page)
         await page.wait_for_function(
             """() => {
                 const text = document.body && document.body.innerText || '';
@@ -404,7 +429,7 @@ class BrowserSession:
                     text = (await b.inner_text()).strip()
                 except Exception:  # noqa: BLE001
                     continue
-                if text and (re.search(MODEL_MATCH, text, re.I) or "private" in text.lower()):
+                if text and (re.search(MODEL_MATCH, text, re.I) or text.strip() == "Agent" or "private" in text.lower()):
                     return b
         except Exception:  # noqa: BLE001
             pass
@@ -413,8 +438,7 @@ class BrowserSession:
     async def _ensure_model(self, page: Page) -> None:
         btn = await self._model_button(page)
         if btn is None:
-            log.warning("Кнопка выбора модели не найдена — работаю с текущей моделью")
-            return
+            raise RuntimeError("Cannot verify model selector; refusing to use an unknown model")
 
         current = ""
         with contextlib.suppress(Exception):
@@ -436,7 +460,7 @@ class BrowserSession:
                     await page.wait_for_timeout(700)
                     break
 
-        opt = page.locator(OPTION_SELECTOR).filter(has_text=re.compile(MODEL_MATCH, re.I)).first
+        opt = page.get_by_text(re.compile(MODEL_MATCH, re.I)).last
         await opt.wait_for(state="visible", timeout=20_000)
         await opt.click()
         await page.wait_for_timeout(500)
@@ -478,7 +502,7 @@ class BrowserSession:
                 await self._shot(page, "prepare_fail")
                 raise
 
-            baseline = await self._transcript(page)
+            baseline_count = await page.locator(SEL_ASSISTANT).count()
 
             ta = page.locator(SEL_TEXTAREA).first
             await ta.click()
@@ -493,7 +517,7 @@ class BrowserSession:
             answer = ""
             while time.monotonic() - started_at < START_TIMEOUT:
                 await asyncio.sleep(0.3)
-                answer = _clean_answer(await self._transcript(page), baseline, prompt)
+                answer = await self._answer(page, baseline_count)
                 if answer.strip() or await self._is_generating(page):
                     break
             else:
@@ -509,11 +533,13 @@ class BrowserSession:
 
             while time.monotonic() < deadline:
                 await asyncio.sleep(0.25)
-                current = _clean_answer(await self._transcript(page), baseline, prompt)
+                current = await self._answer(page, baseline_count)
 
                 if current != answer:
                     answer = current
                     last_change = time.monotonic()
+                    if on_delta and not current.startswith(emitted):
+                        raise RuntimeError("Upstream rewrote streamed content")
                     if on_delta and len(current) > len(emitted):
                         delta = current[len(emitted):]
                         emitted = current
@@ -524,9 +550,11 @@ class BrowserSession:
                 if idle >= STABLE_SEC and not await self._is_generating(page):
                     break
             else:
-                log.warning("Таймаут генерации, отдаю накопленное")
+                raise RuntimeError("Generation deadline exceeded; refusing to report a normal completion")
 
             await self._shot(page, "done")
+            if not answer.strip():
+                raise RuntimeError("Model returned no assistant content")
             return answer.strip()
 
 
@@ -649,18 +677,15 @@ async def root() -> dict[str, Any]:
 
 @app.get("/healthz", summary="Состояние браузерной сессии")
 async def healthz() -> JSONResponse:
-    page = SESSION._page
-    state: dict[str, Any] = {
-        "ok": bool(page and not page.is_closed()),
-        "url": page.url if page and not page.is_closed() else None,
-        "model_selector": None,
-    }
-    if page and not page.is_closed():
-        with contextlib.suppress(Exception):
-            btn = await SESSION._model_button(page)
-            if btn is not None:
-                state["model_selector"] = (await btn.inner_text()).strip()
-    return JSONResponse(state, status_code=200 if state["ok"] else 503)
+    try:
+        page = await SESSION._page_or_start()
+        account = page.locator('[data-testid="account-menu"]')
+        authenticated = bool(await account.count() and "Venice Guest" not in await account.inner_text())
+        return JSONResponse({"ok": authenticated, "authenticated": authenticated},
+                            status_code=200 if authenticated else 503)
+    except Exception:
+        await SESSION.close()
+        return JSONResponse({"ok": False, "authenticated": False}, status_code=503)
 
 
 @app.get("/v1/models", summary="Список доступных моделей", dependencies=[Depends(_auth)])
@@ -687,6 +712,8 @@ async def list_models() -> dict[str, Any]:
     dependencies=[Depends(_auth)],
 )
 async def chat_completions(req: ChatCompletionRequest):
+    if req.model != MODEL_ID:
+        raise HTTPException(400, "Unsupported model")
     prompt = _flatten(req.messages)
     if not prompt.strip():
         raise HTTPException(400, "messages пусты")
