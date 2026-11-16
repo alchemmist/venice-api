@@ -181,11 +181,20 @@ class BrowserSession:
         self._ctx: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._lock = asyncio.Lock()
+        self._cdp = False
 
     # ------------------------- низкий уровень ------------------------------ #
 
     async def _launch(self) -> None:
         self._pw = await async_playwright().start()
+        cdp = os.getenv("CDP_URL", "").strip()
+        if cdp:
+            browser = await self._pw.chromium.connect_over_cdp(cdp)
+            self._cdp = True
+            self._ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+            self._ctx.set_default_timeout(30_000)
+            log.info("Подключен Chrome по CDP %s", cdp)
+            return
         user_data_dir, profile_dir = _chrome_profile()
         Path(user_data_dir).mkdir(parents=True, exist_ok=True)
         args = [
@@ -272,9 +281,11 @@ class BrowserSession:
         return self._page
 
     async def close(self) -> None:
-        with contextlib.suppress(Exception):
-            if self._ctx:
-                await self._ctx.close()
+        # CDP сессия — это уже запущенный Chrome, его не закрываем.
+        if not self._cdp:
+            with contextlib.suppress(Exception):
+                if self._ctx:
+                    await self._ctx.close()
         with contextlib.suppress(Exception):
             if self._pw:
                 await self._pw.stop()
