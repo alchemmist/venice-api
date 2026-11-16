@@ -4,11 +4,11 @@
 venice_agent_bridge.py
 ======================
 
-OpenAI-совместимый фасад над веб-интерфейсом Venice Agentic Chat.
+OpenAI-совместимый фасад над веб-интерфейсом Venice Classic Chat.
 
 Снаружи:  обычный /v1/chat/completions + /v1/models + /openapi.json (Swagger на /docs).
 Внутри:   Playwright, persistent-профиль с залогиненной сессией, навигация в
-          Agentic Chat (/chat/agent), принудительный выбор модели
+          Classic Chat (/chat/classic), принудительный выбор модели
           "DeepSeek V4.1 Flash Uncensored" (Private), ввод промпта, чтение ответа
           из DOM с построчной отдачей по SSE.
 
@@ -64,7 +64,7 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on", "y")
 
 BASE_URL     = os.getenv("VENICE_BASE_URL", "https://venice.ai").rstrip("/")
-AGENT_PATH   = os.getenv("VENICE_AGENT_PATH", "/chat/agent")
+AGENT_PATH   = os.getenv("VENICE_AGENT_PATH", "/chat/classic")
 AGENT_URL    = BASE_URL + AGENT_PATH
 
 HEADLESS     = _env_bool("HEADLESS", True)
@@ -146,7 +146,7 @@ SEL_COMPOSER = (
     'form:has(textarea[name="prompt-textarea"])'
 )
 SEL_SCROLL   = ".minds-chat-scroll-root"
-SEL_ASSISTANT = ".assistant .assistant-content .prose"
+SEL_ASSISTANT = '.assistant[data-testid="text-chat-message"] .prose'
 AGENT_SOURCE_EXTRACTOR = r"""el => {
     // Source of THIS rendered assistant Markdown component, before Markdown
     // consumes JSON escapes. No clipboard, network replay or whole-chat state.
@@ -167,7 +167,7 @@ AGENT_SOURCE_EXTRACTOR = r"""el => {
 }"""
 SEL_STOP     = 'button[aria-label*="stop" i], button[data-testid*="stop" i]'
 SEL_SEND     = 'button[aria-label*="send" i], button[data-testid*="send" i]'
-SEL_AGENT_LINK = 'a[href="/chat/agent"], a[href^="/chat/agent?"]'
+SEL_AGENT_LINK = 'a[href="/chat/classic"]'
 
 # Кандидаты на кнопку выбора модели (ищем внутри composer)
 MODEL_BUTTON_SELECTORS = (
@@ -209,8 +209,8 @@ class BrowserBusyError(RuntimeError):
 AGENT_TEXT_MODEL_ID = os.getenv("AGENT_TEXT_MODEL_ID", "deepseek-v4-1-flash-uncensored").strip()
 AGENT_INFERENCE_ORIGIN = os.getenv("AGENT_INFERENCE_ORIGIN", "https://outerface.venice.ai").rstrip("/")
 AGENT_ROUTE_PATTERN = "**/api/inference/**"
-AGENT_ROUTE_SOURCE = "/api/inference/chat/agents/venice"
-AGENT_ROUTE_TARGET = "/api/inference/chat/agents/ad-hoc"
+AGENT_ROUTE_SOURCE = "/api/inference/chat"
+AGENT_ROUTE_TARGET = "/api/inference/chat"
 AGENT_TRANSPORT_INSTRUCTIONS = """You are a text-only reasoning engine for an external LOCAL Pi coding agent.
 You have NO tools in this browser runtime. Never call native tools, search, sandboxes, agents or paid services.
 The user message contains an external host transcript and JSON response protocol. Follow that protocol exactly.
@@ -253,19 +253,20 @@ class AgentBrowserTransport:
                     parts.path != AGENT_ROUTE_SOURCE or self.rewritten or not AGENT_TEXT_MODEL_ID):
                 raise ValueError("Unexpected inference request")
             body = request.post_data_json
-            message = body["input"]["messages"][-1]
-            content = message["content"]
-            if (message.get("role") != "user" or message.get("type") != "message" or
-                    message.get("status") != "completed" or not isinstance(message.get("id"), str) or
-                    len(content) != 1 or
-                    content[0].get("type") != "output_text" or content[0].get("text") != self.prompt):
+            message = body["prompt"][-1]
+            composer_text = message.get("content")
+            expected_texts = (self.prompt, "/think " + self.prompt)
+            if (message.get("role") != "user" or composer_text not in expected_texts or
+                    not isinstance(body.get("requestId"), str) or not body["requestId"]):
                 raise ValueError("Unexpected composer payload")
             instructions = AGENT_TRANSPORT_INSTRUCTIONS if self.structured else TEXT_TRANSPORT_INSTRUCTIONS
             payload = {
-                "clientTools": [], "tools": [], "modelId": AGENT_TEXT_MODEL_ID,
-                "messages": [{"id": message["id"], "role": "user", "type": "message", "status": "completed",
-                              "content": [{"annotations": [], "type": "output_text", "text": self.prompt}]}],
-                "systemPrompt": {"instructions": instructions},
+                "modelId": AGENT_TEXT_MODEL_ID, "requestId": body["requestId"],
+                "conversationType": "text", "simpleMode": True, "reasoning": True,
+                "includeVeniceSystemPrompt": False, "enableStructuredSystemPrompt": False,
+                "webEnabled": False, "webScrapeEnabled": False, "xSearchEnabled": False,
+                "prompt": [{"role": "user", "content": self.prompt}],
+                "systemPrompt": instructions,
             }
             self.rewritten += 1
             await route.continue_(url=urlunsplit(parts._replace(path=AGENT_ROUTE_TARGET, query="")),
@@ -515,7 +516,7 @@ class BrowserSession:
         await page.wait_for_function(
             """() => {
                 const text = document.body && document.body.innerText || '';
-                return text.includes('Agentic Chat') && !text.trim().startsWith('Loading');
+                return location.pathname === '/chat/classic' && !text.trim().startsWith('Loading');
             }""",
             timeout=NAV_TIMEOUT * 1000,
         )
@@ -524,24 +525,9 @@ class BrowserSession:
         await page.wait_for_timeout(1200)
 
     async def _ensure_agent_view(self, page: Page) -> None:
-        """Гарантирует, что выбран именно Agentic Chat, а не classic/studio."""
-        if AGENT_PATH in page.url:
-            link = page.locator(SEL_AGENT_LINK).first
-            try:
-                if await link.count():
-                    active = await link.get_attribute("data-active")
-                    if active is not None:
-                        return
-            except Exception:  # noqa: BLE001
-                pass
-            # ссылка есть, но не активна -> кликаем
-            try:
-                if await link.count() and await link.is_visible():
-                    await link.click(timeout=5000)
-                    await page.wait_for_timeout(1200)
-                    return
-            except Exception:  # noqa: BLE001
-                pass
+        """Гарантирует неагентный Classic Chat, без внутреннего tool runtime."""
+        if urlsplit(page.url).path == AGENT_PATH:
+            return
         await self._new_chat(page)
 
     async def _model_button(self, page: Page):
@@ -843,8 +829,8 @@ app = FastAPI(
     title="Venice Agentic Bridge",
     version="1.0.0",
     description=(
-        "OpenAI-совместимый шлюз к веб-интерфейсу Venice Agentic Chat. "
-        "Внутри — Playwright, жёстко зафиксированный Agentic Chat и модель "
+        "OpenAI-совместимый шлюз к веб-интерфейсу Venice Classic Chat. "
+        "Внутри — Playwright, жёстко зафиксированный Classic Chat и модель "
         "DeepSeek V4.1 Flash Uncensored (Private)."
     ),
     lifespan=lifespan,

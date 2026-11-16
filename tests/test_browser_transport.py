@@ -15,7 +15,8 @@ class BrowserTransportTests(unittest.IsolatedAsyncioTestCase):
         route.request.url = bridge.AGENT_INFERENCE_ORIGIN + (path or bridge.AGENT_ROUTE_SOURCE) + "?model=native"
         route.request.post_data_json = {
             "clientTools": [{"name": "approve_paid_usage"}],
-            "input": {"messages": [{"id": "fixture-id", "type": "message", "status": "completed", "role": "user", "content": [{"type": "output_text", "text": prompt}]}]},
+            "requestId": "fixture-id", "webEnabled": True,
+            "prompt": [{"role": "user", "content": prompt}],
         }
         return route
 
@@ -27,12 +28,16 @@ class BrowserTransportTests(unittest.IsolatedAsyncioTestCase):
         sent = route.continue_.call_args.kwargs
         self.assertEqual(sent["url"], bridge.AGENT_INFERENCE_ORIGIN + bridge.AGENT_ROUTE_TARGET)
         payload = json.loads(sent["post_data"])
-        self.assertEqual(payload["tools"], [])
-        self.assertEqual(payload["clientTools"], [])
+        self.assertNotIn("tools", payload)
+        self.assertNotIn("clientTools", payload)
         self.assertEqual(payload["modelId"], bridge.AGENT_TEXT_MODEL_ID)
-        self.assertEqual(set(payload), {"tools", "clientTools", "modelId", "messages", "systemPrompt"})
-        self.assertEqual(payload["systemPrompt"]["instructions"], bridge.AGENT_TRANSPORT_INSTRUCTIONS)
-        self.assertEqual(payload["messages"][0]["content"][0]["text"], "fixture")
+        self.assertEqual(set(payload), {"modelId", "requestId", "conversationType", "simpleMode", "reasoning", "includeVeniceSystemPrompt", "enableStructuredSystemPrompt", "webEnabled", "webScrapeEnabled", "xSearchEnabled", "prompt", "systemPrompt"})
+        for flag in ("webEnabled", "webScrapeEnabled", "xSearchEnabled", "includeVeniceSystemPrompt", "enableStructuredSystemPrompt"):
+            self.assertIs(payload[flag], False)
+        self.assertEqual(bridge.AGENT_PATH, "/chat/classic")
+        self.assertEqual(bridge.AGENT_ROUTE_TARGET, "/api/inference/chat")
+        self.assertEqual(payload["systemPrompt"], bridge.AGENT_TRANSPORT_INSTRUCTIONS)
+        self.assertEqual(payload["prompt"][0]["content"], "fixture")
         route.abort.assert_not_awaited()
 
     async def test_plain_and_compaction_use_text_only_system_not_json_requirement(self):
@@ -40,20 +45,32 @@ class BrowserTransportTests(unittest.IsolatedAsyncioTestCase):
         route = self.route()
         await transport.route(route)
         payload = json.loads(route.continue_.call_args.kwargs["post_data"])
-        self.assertEqual(payload["systemPrompt"]["instructions"], bridge.TEXT_TRANSPORT_INSTRUCTIONS)
-        self.assertEqual(payload["tools"], [])
+        self.assertEqual(payload["systemPrompt"], bridge.TEXT_TRANSPORT_INSTRUCTIONS)
+        self.assertNotIn("tools", payload)
+
+    async def test_only_known_ui_thinking_prefix_is_normalized(self):
+        transport = bridge.AgentBrowserTransport("fixture")
+        route = self.route(prompt="/think fixture")
+        await transport.route(route)
+        transport.check(complete=True)
+        self.assertEqual(json.loads(route.continue_.call_args.kwargs["post_data"])["prompt"][0]["content"], "fixture")
+        for text in (" /think fixture", "fixture extra", "/think /think fixture", "/no_think fixture"):
+            transport = bridge.AgentBrowserTransport("fixture")
+            route = self.route(prompt=text)
+            await transport.route(route)
+            route.abort.assert_awaited_once()
 
     async def test_browser_history_is_not_replayed(self):
         transport = bridge.AgentBrowserTransport("fixture")
         route = self.route()
-        route.request.post_data_json["input"]["messages"].insert(0, {"role": "assistant", "content": "stale browser state"})
+        route.request.post_data_json["prompt"].insert(0, {"role": "assistant", "content": "stale browser state"})
         await transport.route(route)
         payload = json.loads(route.continue_.call_args.kwargs["post_data"])
-        self.assertEqual(len(payload["messages"]), 1)
+        self.assertEqual(len(payload["prompt"]), 1)
         self.assertNotIn("stale browser state", json.dumps(payload))
 
     async def test_unknown_or_continuation_endpoints_are_blocked(self):
-        for path in ["/api/inference/image", bridge.AGENT_ROUTE_TARGET, bridge.AGENT_ROUTE_SOURCE + "/changed"]:
+        for path in ["/api/inference/image", "/api/inference/chat/agents/venice", "/api/inference/chat/agents/ad-hoc", bridge.AGENT_ROUTE_SOURCE + "/changed"]:
             transport = bridge.AgentBrowserTransport("fixture")
             route = self.route(path)
             await transport.route(route)
@@ -73,8 +90,9 @@ class BrowserTransportTests(unittest.IsolatedAsyncioTestCase):
             transport.check(complete=True)
 
     async def test_unexpected_composer_and_schema_changes_fail_closed(self):
-        bodies = [{}, {"input": {"messages": []}}, {"input": {"messages": [{"role": "assistant", "content": []}]}},
-                  {"input": {"messages": [{"role": "user", "content": [{"type": "output_text", "text": "different"}]}]}}]
+        bodies = [{}, {"prompt": []}, {"prompt": [{"role": "assistant", "content": "fixture"}], "requestId": "x"},
+                  {"prompt": [{"role": "user", "content": "different"}], "requestId": "x"},
+                  {"prompt": [{"role": "user", "content": "fixture"}], "requestId": ""}]
         for body in bodies:
             transport = bridge.AgentBrowserTransport("fixture")
             route = self.route()

@@ -3,9 +3,9 @@
 The bridge translates declared OpenAI function tools and ordered messages into a
 strict JSON-envelope prompt in the **existing Venice browser**, not Venice's paid
 API. It never runs tools on the bridge: Pi executes them locally under its own
-permissions. The browser now forwards its composer request to the web client's
-ad-hoc text mode with an explicit model/system prompt and empty server/client
-tool lists. Pi tool schemas remain EXTERNAL transcript data, not Venice tools.
+permissions. The browser uses Classic Chat and its `/api/inference/chat` text operation,
+with explicit model/system prompt and disabled native web features. Neither
+`/agents/venice` nor `/agents/ad-hoc` is allowed. Pi tool schemas remain EXTERNAL transcript data, not Venice tools.
 No tokens are extracted and no official paid API client is used. See the README's
 text-only browser transport contract and its fail-closed schema dependency.
 
@@ -128,21 +128,25 @@ The operator's real profile/debug files are never staged by that audit.
 
 ## Native agent isolation regression
 
-The prior `/agents/venice` runtime could internally attempt host tool names and
-then return a valid final envelope falsely reporting missing host tools. Strict
-envelope validation alone cannot detect that semantic failure. All bridge
-completions now use the web UI's `/agents/ad-hoc` text operation with `tools=[]`,
-`clientTools=[]`, explicit modelId and systemPrompt. Empty tools here disable ONLY
-Venice runtime tools: they do not remove the host definitions in the Pi prompt.
-The current composer text must exactly match the request prompt. Only the latest
-UI message is forwarded; host history is never trimmed. Unexpected origin,
-inference path/body or a second POST aborts; lack of interception cannot produce
-a successful final. No native retry/fallback or hidden repair generation exists.
-Page routing is removed in finally, including cancellation during installation.
+The `/agents/venice` AND `/agents/ad-hoc` runtimes can internally interpret
+external JSON tool envelopes and attempt host tool names. Empty `tools` and
+`clientTools` did NOT disable the ad-hoc detector: a real replay of the nightly
+prompt produced `veniceai:tool_call_generation.in_progress` events with detected
+`Unrecognized` bash/read tools, repeated internal model turns and a false final
+report. Those were not Pi toolResult events. The earlier short acceptance did
+not expose this and must not be cited as proof of complete isolation.
 
-Unit tests cover payload whitelist, removed native/paid approval tools, prompt
-binding, foreign origins, unknown and repeated POSTs, ordinary GETs, missing
-interception, plain/compaction text mode, cancellation cleanup, no early delta and
-explicit stream/nonstream transport errors. Browser integration acceptance must
-also cover actual model response, multi-turn route cleanup and poisoned historical
-assistant claims; an isolated successful call is insufficient.
+All completions now use the actual Classic Chat composer and the non-agent
+`/api/inference/chat` endpoint. The browser consumes its normal NDJSON response;
+the bridge still reads exact assistant DOM/React source, not network replay.
+Canonical payload disables Venice system prompt/web search/scraping/X search,
+retains only the latest exact user text (optionally stripping the verified UI
+`/think ` prefix), explicit model/system instructions and request ID. No host
+history is trimmed. All agent endpoints and unexpected inference POSTs fail
+closed. No native fallback, automatic JSON repair or hidden retry is introduced.
+
+Tests cover canonical payload and flags, agent-path rejection, history removal,
+known prefix and unknown text transformations, wrong origin, repeated POSTs,
+plain/compaction instructions, cancellation cleanup and explicit error semantics.
+Live acceptance must reproduce the exact long nightly prompt in ordinary Pi,
+with actual checkpoint files and tests, rather than synthetic reads alone.
