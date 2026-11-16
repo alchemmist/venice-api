@@ -35,6 +35,10 @@ attachment and dictation controls, no verified disable-native-tools switch.
 - Non-stream returns JSON-string function arguments, bridge-generated call ID and
   finish_reason=tool_calls. Buffered SSE emits indexed delta.tool_calls only
   after validation, then tool_calls/[DONE]. Final text emits stop/[DONE].
+- Agent SSE includes the existing approximate character-count usage estimate on
+  the finish chunk so Pi can track context and initiate compaction. This is NOT
+  native token/credit accounting; compaction accuracy and hours-long operation
+  remain unproven. The hard prompt budget is still enforced.
 - Conservative agent prompt budget: 120000 UTF-8 bytes including tool schemas;
   envelope: 65536 bytes. These are adapter safety budgets, not proven model
   context/output limits. Compact Pi history before reaching this budget.

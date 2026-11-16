@@ -863,7 +863,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
         try:
             text = await SESSION.complete(prompt, on_delta, **({"structured": True} if protocol else {}))
-            await queue.put(("final", decode(text)))
+            await queue.put(("final", (*decode(text), _usage(prompt, text))))
         except ProtocolError:
             await queue.put(("error", {"message": "Invalid assistant agent envelope; no tool call emitted", "type": "upstream_protocol_error"}))
         except BrowserBusyError as exc:
@@ -875,16 +875,17 @@ async def chat_completions(req: ChatCompletionRequest):
     def sse(obj: dict[str, Any]) -> str:
         return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
-    def chunk(delta: dict[str, Any], finish: Optional[str] = None) -> str:
-        return sse(
-            {
+    def chunk(delta: dict[str, Any], finish: Optional[str] = None, usage=None) -> str:
+        event = {
                 "id": cid,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": req.model or MODEL_ID,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
             }
-        )
+        if usage is not None:
+            event["usage"] = usage
+        return sse(event)
 
     async def streamer():
         task = asyncio.create_task(worker())
@@ -899,12 +900,12 @@ async def chat_completions(req: ChatCompletionRequest):
                 if kind == "delta":
                     yield chunk({"content": payload})
                 elif kind == "final":
-                    message, finish = payload
+                    message, finish, usage = payload
                     if message.get("tool_calls"):
                         yield chunk({"tool_calls": [dict(call, index=i) for i, call in enumerate(message["tool_calls"])]})
                     elif protocol:
                         yield chunk({"content": message["content"]})
-                    yield chunk({}, finish)
+                    yield chunk({}, finish, usage if protocol else None)
                     yield "data: [DONE]\n\n"
                     break
                 else:

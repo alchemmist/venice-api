@@ -96,6 +96,7 @@ class ResponseTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(call['index'], 0)
                     self.assertEqual(call['function']['name'], 'read')
                     self.assertEqual(events[-1]['choices'][0]['finish_reason'], 'tool_calls')
+                    self.assertGreater(events[-1]['usage']['prompt_tokens'], 0)
                     self.assertTrue(data.endswith('data: [DONE]\n\n'))
                 else:
                     self.assertEqual(response['choices'][0]['finish_reason'], 'tool_calls')
