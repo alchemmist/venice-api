@@ -31,3 +31,15 @@ socrat-5 has substantial available memory; its owner user session manager is run
 ## Remaining unresolved items
 
 Machine egress credential provisioning and its server-side restrictions; browser sandbox acceptance in this runtime; private interactive access implementation; actual Linux Google/Venice login and Cloudflare behavior; profile storage selection and retention. None of these is claimed implemented by this document.
+
+## Implementation receipt (supersedes unresolved infrastructure items above)
+
+Server candidate is deployed and running. Canonical operational state and operator
+steps: homelab/llm-wiki/venice-api.md. The restricted machine SSH key, pinned host
+identity, local Retain PVC, private VNC and deny-direct-egress NetworkPolicy are
+implemented. VPS exit109.120.141.60, shell/non-web forwarding denial, two pod
+recreations/profile-marker persistence and VNC password authentication passed.
+Google Accounts login page is open in the real server Chrome. Initial owner login,
+authenticated Venice inference and session-recovery acceptance remain pending.
+Production bridge has deliberately not been switched. Runtime does not use Mac;
+local kubectl forwarding provides optional operator display only.
