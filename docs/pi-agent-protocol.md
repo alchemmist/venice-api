@@ -23,8 +23,10 @@ attachment and dictation controls, no verified disable-native-tools switch.
   custom/grammar tools and non-text content fail closed. This is NOT a full
   OpenAI API implementation. Sampling/max_tokens remain best-effort/unsupported
   browser semantics, unchanged from plain chat.
-- The complete assistant response must be a raw v1 envelope. No regex extraction,
-  Markdown unwrapping, searching embedded commands, or automatic format repair.
+- The complete assistant DOM response must be exactly one top-level native JSON
+  code block, with no prose, quotation or second block. Its code text must be a
+  raw v1 envelope. This preserves JSON escapes that ordinary Markdown prose
+  consumes. No regex extraction, searching embedded commands or automatic repair.
   Malformed output produces HTTP502 / typed SSE error, never a tool invocation.
   Duplicate JSON keys and non-finite numbers are rejected.
 - Non-stream returns JSON-string function arguments, bridge-generated call ID and
@@ -54,3 +56,20 @@ post-release LiteLLM round trip, fresh sessions, cancellation, ordinary WebUI
 upstream, and bounded longer runs. Prompt injection and native Venice instruction
 conflicts cannot be eliminated by envelope validation: local Pi permissions and
 review are the authority. LiteLLM's existing prompt logging remains enabled.
+
+
+## Transport defect found in the first bounded run
+
+The first public 12-read run exposed a critical Markdown transport limitation:
+raw JSON prose lost backslashes before quotes in a write argument containing
+nested JSON. Validation rejected it; no write occurred. Pi automatically retried
+model errors (distinct from bridge retries), then stopped after repeated failures.
+One independent Venice navigation timeout also occurred before a prompt was sent.
+Do not describe that initial run as successful soak or exactly-once reliability.
+
+The corrected transport requires a sole top-level native code block and reads
+`pre code.textContent` only after strict DOM shape validation, ignoring only the
+native code header. Prose, quoted examples, multiple blocks, and malformed JSON
+remain errors. A live detached-DOM test in server Chrome verifies preservation of
+quotes/newlines/backslashes and rejection of four invalid DOM boundary cases.
+Plain chat extraction remains unchanged.

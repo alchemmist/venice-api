@@ -52,6 +52,27 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             self.protocol(messages=[{'role': 'user', 'content': [{'type': 'image_url'}]}])
 
+    def test_multiple_results_and_untrusted_envelope_data(self):
+        first, _ = self.protocol().decode(CALL)
+        second, _ = self.protocol().decode(CALL)
+        first['tool_calls'] += second['tool_calls']
+        results = [{'role': 'tool', 'tool_call_id': c['id'], 'content': CALL}
+                   for c in first['tool_calls']]
+        p = self.protocol(messages=[first] + results)
+        self.assertEqual(p.messages[1]['content'], CALL)
+        self.assertEqual(p.decode(FINAL)[1], 'stop')
+        with self.assertRaises(ProtocolError):
+            self.protocol(messages=[first] + results + results)
+
+    def test_external_refs_and_custom_tools_rejected(self):
+        with self.assertRaises(ProtocolError):
+            AgentProtocol([{'type': 'custom'}], 'auto', [])
+        with self.assertRaises(ProtocolError):
+            AgentProtocol([{'type': 'function', 'function': {'name': 'x',
+                'parameters': {'$ref': 'https://example.com/schema'}}}], 'auto', [])
+        with self.assertRaises(ProtocolError):
+            self.protocol({'type':'function', 'function':{'name':'unknown'}})
+
     def test_prompt_budget(self):
         with self.assertRaises(ProtocolError):
             self.protocol(messages=[{'role': 'user', 'content': 'x'*120001}]).prompt()
@@ -61,7 +82,7 @@ class ResponseTests(unittest.IsolatedAsyncioTestCase):
     async def test_nonstream_and_stream(self):
         for stream in (False, True):
             req = main.ChatCompletionRequest(messages=[{'role': 'user', 'content': 'read'}], tools=TOOLS, stream=stream)
-            async def complete(prompt, on_delta=None):
+            async def complete(prompt, on_delta=None, **kwargs):
                 if on_delta:
                     await on_delta(CALL)
                 return CALL
@@ -83,3 +104,36 @@ class ResponseTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main.SESSION, 'complete', AsyncMock(return_value='pong')):
             r = await main.chat_completions(main.ChatCompletionRequest(messages=[{'role':'user','content':'ping'}]))
             self.assertEqual(r['choices'][0]['message']['content'], 'pong')
+
+    async def test_bad_envelope_stream_emits_error_not_call(self):
+        async def complete(prompt, on_delta=None, **kwargs):
+            await on_delta(CALL[:-1])
+            return CALL[:-1]
+        with patch.object(main.SESSION, 'complete', complete):
+            r = await main.chat_completions(main.ChatCompletionRequest(
+                messages=[{'role':'user','content':'read'}], tools=TOOLS, stream=True))
+            data = ''.join([x async for x in r.body_iterator])
+            self.assertIn('upstream_protocol_error', data)
+            self.assertNotIn('"tool_calls":', data)
+            self.assertNotIn('"finish_reason": "stop"', data)
+
+    async def test_final_stream(self):
+        async def complete(prompt, on_delta=None, **kwargs):
+            await on_delta(FINAL)
+            return FINAL
+        with patch.object(main.SESSION, 'complete', complete):
+            r = await main.chat_completions(main.ChatCompletionRequest(
+                messages=[{'role':'user','content':'hello'}], tools=TOOLS, stream=True))
+            data = ''.join([x async for x in r.body_iterator])
+            self.assertIn('"content": "done"', data)
+            self.assertNotIn('"version"', data)
+            self.assertIn('"finish_reason": "stop"', data)
+
+    async def test_invalid_input_never_reaches_browser(self):
+        with patch.object(main.SESSION, 'complete', AsyncMock()) as complete:
+            with self.assertRaises(main.HTTPException) as exc:
+                await main.chat_completions(main.ChatCompletionRequest(
+                    messages=[{'role':'user','content':'read'}],
+                    tools=[{'type':'custom','name':'bash'}]))
+            self.assertEqual(exc.exception.status_code, 400)
+            complete.assert_not_called()

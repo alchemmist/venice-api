@@ -143,6 +143,19 @@ SEL_COMPOSER = (
 )
 SEL_SCROLL   = ".minds-chat-scroll-root"
 SEL_ASSISTANT = ".assistant .assistant-content .prose"
+AGENT_CODE_EXTRACTOR = r"""el => {
+    const nodes = [...el.childNodes].filter(n => n.nodeType !== 3 || n.textContent.trim());
+    if (!nodes.length) return '';
+    if (nodes.length !== 1 || nodes[0].nodeType !== 1 ||
+        !nodes[0].classList.contains('codeblock')) return 'INVALID_AGENT_DOM';
+    const block = nodes[0];
+    if (block.querySelectorAll('pre code').length !== 1 ||
+        block.querySelectorAll('.codeblock').length) return 'INVALID_AGENT_DOM';
+    const copy = block.cloneNode(true);
+    copy.querySelectorAll('pre, .code-block-header').forEach(n => n.remove());
+    if (copy.textContent.trim()) return 'INVALID_AGENT_DOM';
+    return block.querySelector('pre code').textContent;
+}"""
 SEL_STOP     = 'button[aria-label*="stop" i], button[data-testid*="stop" i]'
 SEL_SEND     = 'button[aria-label*="send" i], button[data-testid*="send" i]'
 SEL_AGENT_LINK = 'a[href="/chat/agent"], a[href^="/chat/agent?"]'
@@ -344,10 +357,14 @@ class BrowserSession:
         except Exception as exc:  # noqa: BLE001
             log.debug("Не смог снять скриншот: %s", exc)
 
-    async def _answer(self, page: Page, baseline_count: int) -> str:
+    async def _answer(self, page: Page, baseline_count: int, structured: bool = False) -> str:
         messages = page.locator(SEL_ASSISTANT)
         if await messages.count() <= baseline_count:
             return ""
+        if structured:
+            # Markdown prose consumes JSON backslash escapes. Only a sole native
+            # code block preserves the exact bytes; never search a quoted block.
+            return await messages.last.evaluate(AGENT_CODE_EXTRACTOR)
         return await messages.last.inner_text()
 
     async def _is_generating(self, page: Page) -> bool:
@@ -538,6 +555,7 @@ class BrowserSession:
         self,
         prompt: str,
         on_delta: Optional[Callable[[str], Awaitable[None]]] = None,
+        structured: bool = False,
     ) -> str:
         async with self.request_slot():
             page = await self._page_or_start()
@@ -562,7 +580,7 @@ class BrowserSession:
             answer = ""
             while time.monotonic() - started_at < START_TIMEOUT:
                 await asyncio.sleep(0.3)
-                answer = await self._answer(page, baseline_count)
+                answer = await self._answer(page, baseline_count, structured)
                 if answer.strip() or await self._is_generating(page):
                     break
             else:
@@ -577,7 +595,7 @@ class BrowserSession:
 
             while time.monotonic() < deadline:
                 await asyncio.sleep(0.25)
-                current = await self._answer(page, baseline_count)
+                current = await self._answer(page, baseline_count, structured)
 
                 if current != answer:
                     answer = current
@@ -806,7 +824,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if not req.stream:
         try:
-            text = await SESSION.complete(prompt)
+            text = await SESSION.complete(prompt, **({"structured": True} if protocol else {}))
             message, finish = decode(text)
         except ProtocolError:
             raise HTTPException(502, "Invalid assistant agent envelope; no tool call emitted") from None
@@ -839,7 +857,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 await queue.put(("delta", delta))
 
         try:
-            text = await SESSION.complete(prompt, on_delta)
+            text = await SESSION.complete(prompt, on_delta, **({"structured": True} if protocol else {}))
             await queue.put(("final", decode(text)))
         except ProtocolError:
             await queue.put(("error", {"message": "Invalid assistant agent envelope; no tool call emitted", "type": "upstream_protocol_error"}))
