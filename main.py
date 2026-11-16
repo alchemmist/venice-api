@@ -338,9 +338,16 @@ class BrowserSession:
 
     async def _new_chat(self, page: Page) -> None:
         await page.goto(AGENT_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT * 1000)
+        await page.wait_for_function(
+            """() => {
+                const text = document.body && document.body.innerText || '';
+                return text.includes('Agentic Chat') && !text.trim().startsWith('Loading');
+            }""",
+            timeout=NAV_TIMEOUT * 1000,
+        )
         await page.wait_for_selector(SEL_TEXTAREA, state="visible", timeout=NAV_TIMEOUT * 1000)
         await self._dismiss_overlays(page)
-        await page.wait_for_timeout(700)
+        await page.wait_for_timeout(1200)
 
     async def _ensure_agent_view(self, page: Page) -> None:
         """Гарантирует, что выбран именно Agentic Chat, а не classic/studio."""
