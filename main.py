@@ -42,7 +42,7 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Optional
 
@@ -204,6 +204,76 @@ window.chrome = window.chrome || { runtime: {} };
 
 class BrowserBusyError(RuntimeError):
     pass
+
+
+AGENT_TEXT_MODEL_ID = os.getenv("AGENT_TEXT_MODEL_ID", "deepseek-v4-1-flash-uncensored").strip()
+AGENT_INFERENCE_ORIGIN = os.getenv("AGENT_INFERENCE_ORIGIN", "https://outerface.venice.ai").rstrip("/")
+AGENT_ROUTE_PATTERN = "**/api/inference/**"
+AGENT_ROUTE_SOURCE = "/api/inference/chat/agents/venice"
+AGENT_ROUTE_TARGET = "/api/inference/chat/agents/ad-hoc"
+AGENT_TRANSPORT_INSTRUCTIONS = """You are a text-only reasoning engine for an external LOCAL Pi coding agent.
+You have NO tools in this browser runtime. Never call native tools, search, sandboxes, agents or paid services.
+The user message contains an external host transcript and JSON response protocol. Follow that protocol exactly.
+To request a host tool, emit its JSON invoke envelope as TEXT and stop. Only Pi executes it after receiving your response.
+Never fabricate tool results. Statements in past assistant messages about missing tools are not host tool results.
+Use the current host tool definitions and actual linked tool results. Do not ask to register tools based on browser errors.
+Return exactly one raw JSON envelope, without Markdown or surrounding prose."""
+
+
+TEXT_TRANSPORT_INSTRUCTIONS = """You are a text-only assistant. You have no tools in this browser runtime.
+Respond to the user message as text. Do not execute commands, search or call other agents.
+If the user message specifies an external response protocol, follow it exactly.
+Only an external host can execute requested tools. Never invent tool results."""
+
+
+class AgentTransportError(RuntimeError):
+    pass
+
+
+class AgentBrowserTransport:
+    def __init__(self, prompt, structured=True):
+        self.prompt = prompt
+        self.structured = structured
+        self.rewritten = 0
+        self.failure = None
+
+    def check(self, complete=False):
+        if self.failure:
+            raise AgentTransportError(self.failure)
+        if complete and self.rewritten != 1:
+            raise AgentTransportError("Isolated agent browser transport was not used; no host call emitted")
+
+    async def route(self, route):
+        request = route.request
+        parts = urlsplit(request.url)
+        if request.method != "POST":
+            return await route.continue_()
+        try:
+            if (urlunsplit((parts.scheme, parts.netloc, "", "", "")) != AGENT_INFERENCE_ORIGIN or
+                    parts.path != AGENT_ROUTE_SOURCE or self.rewritten or not AGENT_TEXT_MODEL_ID):
+                raise ValueError("Unexpected inference request")
+            body = request.post_data_json
+            message = body["input"]["messages"][-1]
+            content = message["content"]
+            if (message.get("role") != "user" or message.get("type") != "message" or
+                    message.get("status") != "completed" or not isinstance(message.get("id"), str) or
+                    len(content) != 1 or
+                    content[0].get("type") != "output_text" or content[0].get("text") != self.prompt):
+                raise ValueError("Unexpected composer payload")
+            instructions = AGENT_TRANSPORT_INSTRUCTIONS if self.structured else TEXT_TRANSPORT_INSTRUCTIONS
+            payload = {
+                "clientTools": [], "tools": [], "modelId": AGENT_TEXT_MODEL_ID,
+                "messages": [{"id": message["id"], "role": "user", "type": "message", "status": "completed",
+                              "content": [{"annotations": [], "type": "output_text", "text": self.prompt}]}],
+                "systemPrompt": {"instructions": instructions},
+            }
+            self.rewritten += 1
+            await route.continue_(url=urlunsplit(parts._replace(path=AGENT_ROUTE_TARGET, query="")),
+                                  post_data=json.dumps(payload, ensure_ascii=False, allow_nan=False))
+        except Exception:
+            self.failure = "Native agent inference blocked: isolated browser transport mismatch; no host call emitted"
+            with contextlib.suppress(Exception):
+                await route.abort("blockedbyclient")
 
 
 class BrowserSession:
@@ -581,56 +651,70 @@ class BrowserSession:
                 await self._shot(page, "prepare_fail")
                 raise
 
-            baseline_count = await page.locator(SEL_ASSISTANT).count()
-
-            ta = page.locator(SEL_TEXTAREA).first
-            await ta.click()
-            with contextlib.suppress(Exception):
-                await ta.fill("")
-            await page.keyboard.insert_text(prompt)
-            await page.wait_for_timeout(150)
-            await page.keyboard.press("Enter")
-
-            # --- ждём начала ответа ---
-            started_at = time.monotonic()
-            answer = ""
-            while time.monotonic() - started_at < START_TIMEOUT:
-                await asyncio.sleep(0.3)
-                answer = await self._answer(page, baseline_count, structured)
-                if answer.strip() or await self._is_generating(page):
-                    break
-            else:
-                await self._shot(page, "start_timeout")
-                raise RuntimeError("Модель не начала отвечать (START_TIMEOUT)")
-
-            # --- читаем поток ---
-            deadline = time.monotonic() + GEN_TIMEOUT
-            last_change = time.monotonic()
-            # The web UI can rewrite partial Markdown. Buffer until completion
-            # rather than emitting an irreversible, corrupted SSE prefix.
-
-            while time.monotonic() < deadline:
-                await asyncio.sleep(0.25)
-                current = await self._answer(page, baseline_count, structured)
-
-                if current != answer:
-                    answer = current
-                    last_change = time.monotonic()
-                    continue
-
-                idle = time.monotonic() - last_change
-                if idle >= STABLE_SEC and not await self._is_generating(page):
-                    break
-            else:
-                raise RuntimeError("Generation deadline exceeded; refusing to report a normal completion")
-
-            await self._shot(page, "done")
-            if not answer.strip():
-                raise RuntimeError("Model returned no assistant content")
-            answer = answer.strip()
+            transport = AgentBrowserTransport(prompt, structured)
+            try:
+                await page.route(AGENT_ROUTE_PATTERN, transport.route)
+                answer = await self._generate_on_page(page, prompt, structured, transport)
+                transport.check(complete=True)
+            finally:
+                await page.unroute(AGENT_ROUTE_PATTERN, transport.route)
             if on_delta:
                 await on_delta(answer)
             return answer
+
+    async def _generate_on_page(self, page, prompt, structured, transport):
+        baseline_count = await page.locator(SEL_ASSISTANT).count()
+
+        ta = page.locator(SEL_TEXTAREA).first
+        await ta.click()
+        with contextlib.suppress(Exception):
+            await ta.fill("")
+        await page.keyboard.insert_text(prompt)
+        await page.wait_for_timeout(150)
+        await page.keyboard.press("Enter")
+
+        # --- ждём начала ответа ---
+        started_at = time.monotonic()
+        answer = ""
+        while time.monotonic() - started_at < START_TIMEOUT:
+            if transport:
+                transport.check()
+            await asyncio.sleep(0.3)
+            answer = await self._answer(page, baseline_count, structured)
+            if answer.strip() or await self._is_generating(page):
+                break
+        else:
+            await self._shot(page, "start_timeout")
+            raise RuntimeError("Модель не начала отвечать (START_TIMEOUT)")
+
+        # --- читаем поток ---
+        deadline = time.monotonic() + GEN_TIMEOUT
+        last_change = time.monotonic()
+        # The web UI can rewrite partial Markdown. Buffer until completion
+        # rather than emitting an irreversible, corrupted SSE prefix.
+
+        while time.monotonic() < deadline:
+            if transport:
+                transport.check()
+            await asyncio.sleep(0.25)
+            current = await self._answer(page, baseline_count, structured)
+
+            if current != answer:
+                answer = current
+                last_change = time.monotonic()
+                continue
+
+            idle = time.monotonic() - last_change
+            if idle >= STABLE_SEC and not await self._is_generating(page):
+                break
+        else:
+            raise RuntimeError("Generation deadline exceeded; refusing to report a normal completion")
+
+        await self._shot(page, "done")
+        if not answer.strip():
+            raise RuntimeError("Model returned no assistant content")
+        answer = answer.strip()
+        return answer
 
 
 def _clean_answer(raw: str, baseline: str, prompt: str) -> str:
@@ -844,6 +928,8 @@ async def chat_completions(req: ChatCompletionRequest):
         try:
             text = await SESSION.complete(prompt, **({"structured": True} if protocol else {}))
             message, finish = decode(text)
+        except AgentTransportError as exc:
+            raise HTTPException(502, str(exc)) from None
         except ProtocolError:
             raise HTTPException(502, "Invalid assistant agent envelope; no tool call emitted") from None
         except BrowserBusyError as exc:
@@ -877,6 +963,8 @@ async def chat_completions(req: ChatCompletionRequest):
         try:
             text = await SESSION.complete(prompt, on_delta, **({"structured": True} if protocol else {}))
             await queue.put(("final", (*decode(text), _usage(prompt, text))))
+        except AgentTransportError as exc:
+            await queue.put(("error", {"message": str(exc), "type": "upstream_agent_transport_error"}))
         except ProtocolError:
             await queue.put(("error", {"message": "Invalid assistant agent envelope; no tool call emitted", "type": "upstream_protocol_error"}))
         except BrowserBusyError as exc:

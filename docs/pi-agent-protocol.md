@@ -3,9 +3,11 @@
 The bridge translates declared OpenAI function tools and ordered messages into a
 strict JSON-envelope prompt in the **existing Venice browser**, not Venice's paid
 API. It never runs tools on the bridge: Pi executes them locally under its own
-permissions. Venice's native instructions still exist; this is a prompt adapter,
-not native system/tool API support. The inspected composer exposed model,
-attachment and dictation controls, no verified disable-native-tools switch.
+permissions. The browser now forwards its composer request to the web client's
+ad-hoc text mode with an explicit model/system prompt and empty server/client
+tool lists. Pi tool schemas remain EXTERNAL transcript data, not Venice tools.
+No tokens are extracted and no official paid API client is used. See the README's
+text-only browser transport contract and its fail-closed schema dependency.
 
 ## Supported contract
 
@@ -43,7 +45,8 @@ attachment and dictation controls, no verified disable-native-tools switch.
   envelope: 65536 bytes. These are adapter safety budgets, not proven model
   context/output limits. Compact Pi history before reaching this budget.
 - Existing one-generation browser lock, queue capacity4/wait180s, authentication,
-  model selection, cancellation and plain chat path are retained.
+  model selection and cancellation are retained. Plain chat and compaction use
+  the same isolated text transport, with non-JSON system instructions.
 
 ## Verification
 
@@ -122,3 +125,24 @@ The shared .dockerignore is an explicit default-deny context allowlist. CI audit
 it using real BuildKit against ONLY staged runtime files and synthetic private
 canaries, then checks bridge imports in the published image before GitOps deploy.
 The operator's real profile/debug files are never staged by that audit.
+
+## Native agent isolation regression
+
+The prior `/agents/venice` runtime could internally attempt host tool names and
+then return a valid final envelope falsely reporting missing host tools. Strict
+envelope validation alone cannot detect that semantic failure. All bridge
+completions now use the web UI's `/agents/ad-hoc` text operation with `tools=[]`,
+`clientTools=[]`, explicit modelId and systemPrompt. Empty tools here disable ONLY
+Venice runtime tools: they do not remove the host definitions in the Pi prompt.
+The current composer text must exactly match the request prompt. Only the latest
+UI message is forwarded; host history is never trimmed. Unexpected origin,
+inference path/body or a second POST aborts; lack of interception cannot produce
+a successful final. No native retry/fallback or hidden repair generation exists.
+Page routing is removed in finally, including cancellation during installation.
+
+Unit tests cover payload whitelist, removed native/paid approval tools, prompt
+binding, foreign origins, unknown and repeated POSTs, ordinary GETs, missing
+interception, plain/compaction text mode, cancellation cleanup, no early delta and
+explicit stream/nonstream transport errors. Browser integration acceptance must
+also cover actual model response, multi-turn route cleanup and poisoned historical
+assistant claims; an isolated successful call is insufficient.

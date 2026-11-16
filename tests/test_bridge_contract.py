@@ -52,13 +52,15 @@ class BridgeContractTests(unittest.IsolatedAsyncioTestCase):
         page.keyboard.insert_text = AsyncMock()
         page.keyboard.press = AsyncMock()
         page.wait_for_timeout = AsyncMock()
+        page.route = AsyncMock()
+        page.unroute = AsyncMock()
         session._page_or_start = AsyncMock(return_value=page)
         session._prepare = AsyncMock()
         session._answer = AsyncMock(side_effect=["partial wrong", "correct final", "correct final"])
         session._is_generating = AsyncMock(return_value=False)
         session._shot = AsyncMock()
         on_delta = AsyncMock()
-        with patch.object(bridge, "STABLE_SEC", -1), patch.object(bridge.asyncio, "sleep", AsyncMock()):
+        with patch.object(bridge, "STABLE_SEC", -1), patch.object(bridge.asyncio, "sleep", AsyncMock()), patch.object(bridge, "AgentBrowserTransport"):
             self.assertEqual(await session.complete("test", on_delta), "correct final")
         on_delta.assert_awaited_once_with("correct final")
 

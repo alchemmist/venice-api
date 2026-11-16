@@ -9,9 +9,37 @@ This is a prompt-based adapter, not native Venice function calling. Pi executes
 local tools; the bridge never executes their commands. Synthetic acceptance has
 verified coding, saved-session replay, codemode, manual compaction and active
 command cancellation. It has **not** certified unattended multi-hour operation.
-Venice's native agent can still interfere and produce misleading claims about
-missing tools. Do not interpret those claims as proof that Pi tool registration
-is broken. Check actual Pi tool events.
+The browser transport now isolates completions from Venice's native agent: it
+forwards the composer request ONCE to the web client's ad-hoc text mode with the
+explicit DeepSeek model, `tools=[]` and `clientTools=[]`. This applies to plain
+chat and compaction too. Pi's declared tools remain in the external transcript;
+only Pi executes them. Old assistant claims about missing tools are not host
+results. Always check actual Pi tool events.
+
+## Text-only browser transport
+
+Prompts are still entered through the real Venice composer and replies read from
+its current assistant component. Playwright intercepts only that page's inference
+requests, preserving the browser's existing authentication without reading or
+exporting bearer tokens. The known `/api/inference/chat/agents/venice` composer
+POST is forwarded to `/api/inference/chat/agents/ad-hoc` on the SAME expected
+first-party origin, using the schema shipped by Venice's web client. No standalone
+HTTP inference client, official paid API call or response replay is used.
+
+The replacement payload contains only the current user message, explicit model,
+text-only system instructions and empty server/client tool lists. Earlier browser
+messages and native paid-approval/media tool declarations are not forwarded.
+Full Pi history remains inside the current host-supplied prompt, including its
+linked errors. Exactly ONE matching inference POST must be rewritten per turn;
+unknown POSTs, native continuations, composer mismatch or a missing interception
+fail closed with HTTP502 / `upstream_agent_transport_error`, never a fake final or
+native fallback. Routing is removed on completion, error and cancellation.
+
+This depends on Venice's PRIVATE WEB-CLIENT schema and may need maintenance after
+an upstream change. It does not make an LLM infallible or replace Pi permissions.
+It intentionally disables Venice-native browsing/media/agent tools for bridge
+completions; external host tools supplied by Pi/WebUI are unaffected. Direct use
+of Venice's web UI outside the bridge is unchanged.
 
 ## Runtime and ownership
 
@@ -88,6 +116,8 @@ Unless explicitly listed as a browser-runtime setting, these configure `main.py`
 | `VENICE_BASE_URL` | `https://venice.ai` | Web UI origin, not paid API base URL. |
 | `VENICE_AGENT_PATH` | `/chat/agent` | Web route. |
 | `MODEL_ID` | ID above | The only accepted bridge model ID. LiteLLM owns the public alias. |
+| `AGENT_TEXT_MODEL_ID` | `deepseek-v4-1-flash-uncensored` | Explicit browser ad-hoc text model; not the public bridge alias. Must match the intended UI model. |
+| `AGENT_INFERENCE_ORIGIN` | `https://outerface.venice.ai` | Expected first-party web-client inference origin. Unknown origin/path/payload or repeated inference POST is blocked, never forwarded to the native agent. |
 | `MODEL_MATCH` | exact DeepSeek V4.1 Flash Uncensored regex | UI model match; absent/unverified selector fails closed. |
 | `AUTO_GOOGLE_LOGIN` | `true` | Reuse the already-authorized Google session for Venice SSO; never bypass password/MFA/consent. Google can revoke the session. |
 | `NEW_CHAT_PER_REQUEST` | `true` | Start a new Venice chat for each API turn; full agent history is serialized into that turn. |
