@@ -210,6 +210,10 @@ class BrowserSession:
             kwargs["user_agent"] = USER_AGENT
         if profile_dir:
             kwargs["ignore_default_args"] = ["--use-mock-keychain"]
+        proxy_server = os.getenv("PROXY_SERVER", "").strip()
+        if proxy_server:
+            kwargs["proxy"] = {"server": proxy_server}
+            log.info("Браузер через прокси %s", proxy_server)
         self._ctx = await self._pw.chromium.launch_persistent_context(**kwargs)
         await self._ctx.add_init_script(STEALTH_JS)
         self._ctx.set_default_timeout(30_000)
