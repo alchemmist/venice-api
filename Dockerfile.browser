@@ -1,0 +1,21 @@
+# Isolated headful Chrome candidate. Not used by the production CI workflow.
+FROM mcr.microsoft.com/playwright/python:v1.55.0-noble
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl xvfb x11vnc openssh-client \
+    && curl --fail --show-error --location --proto '=https' --tlsv1.2 \
+       https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/chrome.deb \
+    && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+    && rm -f /tmp/chrome.deb \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY scripts/browser_probe.py /app/browser_probe.py
+COPY scripts/browser_runtime.py /app/browser_runtime.py
+COPY scripts/browser-entrypoint.sh /app/browser-entrypoint.sh
+RUN mkdir -p /data/profile && chown -R pwuser:pwuser /data
+USER pwuser
+ENV PROFILE_DIR=/data/profile PYTHONUNBUFFERED=1
+# No public ports. Operator access is via authenticated kubectl port-forward.
+CMD ["sh", "/app/browser-entrypoint.sh"]
