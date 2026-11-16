@@ -114,6 +114,7 @@ PORT         = int(os.getenv("PORT", "8080"))
 GEN_TIMEOUT  = float(os.getenv("GEN_TIMEOUT", "600"))    # макс. время генерации, сек
 START_TIMEOUT= float(os.getenv("START_TIMEOUT", "90"))   # ожидание начала ответа, сек
 STABLE_SEC   = float(os.getenv("STABLE_SEC", "2.0"))     # «тишина» = конец ответа
+MODEL_SELECT_TIMEOUT = float(os.getenv("MODEL_SELECT_TIMEOUT", "20"))
 NAV_TIMEOUT  = float(os.getenv("NAV_TIMEOUT", "90"))
 DEBUG        = _env_bool("DEBUG", False)
 DEBUG_DIR    = Path(os.getenv("DEBUG_DIR", "./debug")).resolve()
@@ -429,16 +430,26 @@ class BrowserSession:
                     text = (await b.inner_text()).strip()
                 except Exception:  # noqa: BLE001
                     continue
-                if text and (re.search(MODEL_MATCH, text, re.I) or text.strip() == "Agent" or "private" in text.lower()):
+                if text and (re.search(MODEL_MATCH, text, re.I) or text.strip() in ("Agent", "Auto") or "private" in text.lower()):
                     return b
         except Exception:  # noqa: BLE001
             pass
         return None
 
+    async def _wait_model_button(self, page: Page):
+        deadline = time.monotonic() + MODEL_SELECT_TIMEOUT
+        while True:
+            button = await self._model_button(page)
+            if button is not None:
+                return button
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Cannot verify model selector; refusing to use an unknown model")
+            await asyncio.sleep(0.25)
+
     async def _ensure_model(self, page: Page) -> None:
-        btn = await self._model_button(page)
-        if btn is None:
-            raise RuntimeError("Cannot verify model selector; refusing to use an unknown model")
+        # Hydration can render the composer before its model selector. Wait
+        # before any prompt is submitted; never retry an already sent prompt.
+        btn = await self._wait_model_button(page)
 
         current = ""
         with contextlib.suppress(Exception):
@@ -466,7 +477,7 @@ class BrowserSession:
         await page.wait_for_timeout(500)
 
         # Проверка
-        btn2 = await self._model_button(page)
+        btn2 = await self._wait_model_button(page)
         if btn2 is not None:
             with contextlib.suppress(Exception):
                 text = (await btn2.inner_text()).strip()

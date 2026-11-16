@@ -21,8 +21,17 @@ class BridgeContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_model_selector_fails_closed(self):
         session = bridge.BrowserSession()
         session._model_button = AsyncMock(return_value=None)
-        with self.assertRaisesRegex(RuntimeError, "unknown model"):
-            await session._ensure_model(MagicMock())
+        with patch.object(bridge, "MODEL_SELECT_TIMEOUT", 0):
+            with self.assertRaisesRegex(RuntimeError, "unknown model"):
+                await session._ensure_model(MagicMock())
+
+    async def test_model_selector_can_arrive_after_composer(self):
+        session = bridge.BrowserSession()
+        button = MagicMock()
+        session._model_button = AsyncMock(side_effect=[None, None, button])
+        with patch.object(bridge.asyncio, "sleep", AsyncMock()):
+            self.assertIs(await session._wait_model_button(MagicMock()), button)
+        self.assertEqual(session._model_button.await_count, 3)
 
     async def test_answer_does_not_strip_real_content(self):
         session = bridge.BrowserSession()
