@@ -50,6 +50,7 @@ import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
+from agent_protocol import AgentProtocol, ProtocolError
 from playwright.async_api import BrowserContext, Page, async_playwright
 
 # --------------------------------------------------------------------------- #
@@ -626,6 +627,8 @@ class ChatMessage(BaseModel):
     role: str = "user"
     content: Any = None
     name: Optional[str] = None
+    tool_calls: Optional[list[dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -637,6 +640,9 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
     user: Optional[str] = None
+    tools: Optional[list[dict[str, Any]]] = None
+    tool_choice: Any = None
+    parallel_tool_calls: Optional[bool] = None
 
 
 def _flatten(messages: list[ChatMessage]) -> str:
@@ -777,7 +783,21 @@ async def list_models() -> dict[str, Any]:
 async def chat_completions(req: ChatCompletionRequest):
     if req.model != MODEL_ID:
         raise HTTPException(400, "Unsupported model")
-    prompt = _flatten(req.messages)
+    protocol = None
+    try:
+        if req.tools or any(m.tool_calls or m.role == "tool" for m in req.messages):
+            protocol = AgentProtocol(req.tools or [], req.tool_choice,
+                                     [m.model_dump(exclude_none=True) for m in req.messages])
+            prompt = protocol.prompt()
+        else:
+            if req.tool_choice not in (None, "auto", "none"):
+                raise ProtocolError("Tool choice requires tools")
+            prompt = _flatten(req.messages)
+    except Exception:
+        raise HTTPException(400, "Invalid or unsupported agent request (tools, choice, history, schema or budget)") from None
+
+    def decode(text):
+        return protocol.decode(text) if protocol else ({"role": "assistant", "content": text}, "stop")
     if not prompt.strip():
         raise HTTPException(400, "messages пусты")
 
@@ -787,6 +807,9 @@ async def chat_completions(req: ChatCompletionRequest):
     if not req.stream:
         try:
             text = await SESSION.complete(prompt)
+            message, finish = decode(text)
+        except ProtocolError:
+            raise HTTPException(502, "Invalid assistant agent envelope; no tool call emitted") from None
         except BrowserBusyError as exc:
             raise HTTPException(429, str(exc), headers={"Retry-After": "5"}) from None
         except Exception as exc:  # noqa: BLE001
@@ -801,8 +824,8 @@ async def chat_completions(req: ChatCompletionRequest):
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": finish,
                 }
             ],
             "usage": _usage(prompt, text),
@@ -812,11 +835,14 @@ async def chat_completions(req: ChatCompletionRequest):
 
     async def worker() -> None:
         async def on_delta(delta: str) -> None:
-            await queue.put(("delta", delta))
+            if not protocol:
+                await queue.put(("delta", delta))
 
         try:
             text = await SESSION.complete(prompt, on_delta)
-            await queue.put(("final", text))
+            await queue.put(("final", decode(text)))
+        except ProtocolError:
+            await queue.put(("error", {"message": "Invalid assistant agent envelope; no tool call emitted", "type": "upstream_protocol_error"}))
         except BrowserBusyError as exc:
             await queue.put(("error", {"message": str(exc), "type": "rate_limit_error", "code": 429}))
         except Exception as exc:  # noqa: BLE001
@@ -850,7 +876,12 @@ async def chat_completions(req: ChatCompletionRequest):
                 if kind == "delta":
                     yield chunk({"content": payload})
                 elif kind == "final":
-                    yield chunk({}, "stop")
+                    message, finish = payload
+                    if message.get("tool_calls"):
+                        yield chunk({"tool_calls": [dict(call, index=i) for i, call in enumerate(message["tool_calls"])]})
+                    elif protocol:
+                        yield chunk({"content": message["content"]})
+                    yield chunk({}, finish)
                     yield "data: [DONE]\n\n"
                     break
                 else:
