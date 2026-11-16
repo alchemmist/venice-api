@@ -17,7 +17,7 @@ Those errors were not local Pi results. The fix removes that agent loop entirely
 ## Text-only browser transport
 
 Prompts enter the real `/chat/classic` composer; replies come from the current
-assistant Markdown component's exact React source. The regular browser request
+assistant message's exact raw content, before math/Markdown preprocessing. The regular browser request
 uses `/api/inference/chat` on the expected first-party origin. No tokens are read
 or exported, and no standalone HTTP inference client, official paid API or response
 replay is used. Do not route to `/agents/venice` OR `/agents/ad-hoc`: empty tool
@@ -32,8 +32,18 @@ forwarding; arbitrary prompt transformations are rejected. Exactly ONE matching
 inference POST must pass per turn. Unknown POSTs, agent endpoints, wrong origin,
 composer mismatch, repeats or missing interception fail closed with HTTP502 /
 `upstream_agent_transport_error`, never native fallback. Routing is removed in
-finally, including cancellation. Plain chat and compaction use the same Classic
+finally, including cancellation. Completion also requires the matching browser
+requestfinished event; visual quiet alone cannot release a partial response.
+Plain chat and compaction use the same Classic
 transport with non-JSON instructions. Pi remains the ONLY host tool executor.
+
+Classic's Markdown input is NOT a lossless protocol source: its math preprocessor
+inserts a backslash before dollar signs, making valid shell-variable JSON invalid.
+The extractor resolves the committed React tree to THIS assistant element, then
+reads only its nearest assistant-message content/id/role. It does not inspect other
+messages' contents or use network replay. Unknown/unmounted/oversized trees and
+missing or non-assistant message shapes fail closed; no slash removal or repair.
+This same raw source is used for plain replies and compaction summaries.
 
 The private web-client schema and React source extraction remain maintenance
 dependencies. This does not make an LLM infallible or certify unattended hours.

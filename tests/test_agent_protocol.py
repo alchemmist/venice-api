@@ -149,16 +149,37 @@ class AssistantSourceTests(unittest.TestCase):
         script = r'''const extract = EXTRACTOR;
 const raw = JSON.stringify({pi_bridge:1,action:'invoke',target:'write',payload:{content:'{"x":"y"}\nC:\\tmp\\f `inline` ```code```'}});
 const md = s => ({memoizedProps:{parseIncompleteMarkdown:true,remarkPlugins:[],rehypePlugins:[],children:s}});
-const el = f => ({'__reactFiber$fixture':f});
-const a = md(raw); a.return=md(raw);
+const msg = s => ({memoizedProps:{message:{id:'own',role:'assistant',content:s}}});
+const el = f => {
+    const element = {isConnected:true};
+    const host = {stateNode:element,return:f}; f.child=host;
+    element['__reactFiber$fixture']=host;
+    let top=f;
+    while(top.return) { top.return.child=top; top=top.return; }
+    const root={tag:3,child:top}; root.stateNode={current:root}; top.return=root;
+    return element;
+};
+const a = md('transformed wrong'); a.return=msg(raw);
 if(extract(el(a))!==raw) throw Error('source damaged');
-const b = md(raw); b.return=md('other');
-if(extract(el(b))!=='INVALID_AGENT_SOURCE') throw Error('ambiguous accepted');
+if(extract(el(md(raw)))!=='INVALID_AGENT_SOURCE') throw Error('accepted transformed fallback');
 if(extract({})!=='INVALID_AGENT_SOURCE') throw Error('missing accepted');
-const c = {memoizedProps:{message:{}},return:md(raw)};
-if(extract(el(c))!=='INVALID_AGENT_SOURCE') throw Error('crossed message boundary');
-let d=md(raw); for(let i=0;i<17;i++)d={return:d};
+const b=msg(raw); b.memoizedProps.message.role='user'; b.return=msg(raw);
+if(extract(el(b))!=='INVALID_AGENT_SOURCE') throw Error('crossed message boundary');
+let d=msg(raw); for(let i=0;i<49;i++)d={return:d};
 if(extract(el(d))!=='INVALID_AGENT_SOURCE') throw Error('unbounded traversal');
+const original=JSON.stringify({pi_bridge:1,action:'invoke',target:'bash',payload:{command:'echo "$? ${PIPESTATUS[0]}"; printf "\\n"'}});
+const math=md(original.replaceAll('$','\$')); math.return=msg(original);
+if(extract(el(math))!==original) throw Error('LaTeX dollar preprocessing leaked into protocol');
+const old=msg('stale partial'), fresh=msg(raw), node=el(fresh);
+const root=fresh.return;
+const staleHost={stateNode:node,return:old}; old.child=staleHost;
+old.return=root; old.alternate=fresh; fresh.alternate=old;
+node['__reactFiber$fixture']=staleHost;
+if(extract(node)!==raw) throw Error('stale alternate was read');
+const orphan=el(msg(raw)); orphan.isConnected=false;
+if(extract(orphan)!=='INVALID_AGENT_SOURCE') throw Error('detached accepted');
+const unreachable=el(msg(raw)); unreachable['__reactFiber$fixture'].return.return.child=null;
+if(extract(unreachable)!=='INVALID_AGENT_SOURCE') throw Error('uncommitted host accepted');
 '''.replace('EXTRACTOR', main.AGENT_SOURCE_EXTRACTOR)
         result = subprocess.run(['node', '-e', script], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)

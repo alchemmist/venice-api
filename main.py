@@ -148,22 +148,34 @@ SEL_COMPOSER = (
 SEL_SCROLL   = ".minds-chat-scroll-root"
 SEL_ASSISTANT = '.assistant[data-testid="text-chat-message"] .prose'
 AGENT_SOURCE_EXTRACTOR = r"""el => {
-    // Source of THIS rendered assistant Markdown component, before Markdown
-    // consumes JSON escapes. No clipboard, network replay or whole-chat state.
+    const invalid = 'INVALID_AGENT_SOURCE';
     const keys = Object.keys(el).filter(k => k.startsWith('__reactFiber$'));
-    if (keys.length !== 1) return 'INVALID_AGENT_SOURCE';
-    let fiber = el[keys[0]];
-    const sources = [];
-    for (let i = 0; fiber && i < 16; i++, fiber = fiber.return) {
-        const props = fiber.memoizedProps;
-        if (!props) continue;
-        if (Object.hasOwn(props, 'message')) break;
-        if (Object.hasOwn(props, 'parseIncompleteMarkdown') &&
-            Array.isArray(props.remarkPlugins) && Array.isArray(props.rehypePlugins) &&
-            typeof props.children === 'string') sources.push(props.children);
+    if (keys.length !== 1 || !el.isConnected) return invalid;
+    let root = el[keys[0]], depth = 0;
+    while (root && root.return && depth++ < 2048) root = root.return;
+    if (!root || root.tag !== 3 || !root.stateNode?.current) return invalid;
+    const stack = [{fiber: root.stateNode.current, parent: null}];
+    const seen = new Set();
+    let target = null;
+    while (stack.length && seen.size < 50000) {
+        const frame = stack.pop(), fiber = frame.fiber;
+        if (!fiber || seen.has(fiber)) continue;
+        seen.add(fiber);
+        if (fiber.stateNode === el) { target = frame; break; }
+        if (fiber.sibling) stack.push({fiber: fiber.sibling, parent: frame.parent});
+        if (fiber.child) stack.push({fiber: fiber.child, parent: frame});
     }
-    if (!sources.length || sources.some(s => s !== sources[0])) return 'INVALID_AGENT_SOURCE';
-    return sources[0];
+    if (!target) return invalid;
+    for (let i = 0; target && i < 48; i++, target = target.parent) {
+        const props = target.fiber.memoizedProps;
+        if (!props || !Object.hasOwn(props, 'message')) continue;
+        const message = props.message;
+        if (!message || message.role !== 'assistant' ||
+            typeof message.id !== 'string' || !message.id ||
+            typeof message.content !== 'string') return invalid;
+        return message.content;
+    }
+    return invalid;
 }"""
 SEL_STOP     = 'button[aria-label*="stop" i], button[data-testid*="stop" i]'
 SEL_SEND     = 'button[aria-label*="send" i], button[data-testid*="send" i]'
@@ -236,12 +248,22 @@ class AgentBrowserTransport:
         self.structured = structured
         self.rewritten = 0
         self.failure = None
+        self.request = None
+        self.finished = False
 
     def check(self, complete=False):
         if self.failure:
             raise AgentTransportError(self.failure)
-        if complete and self.rewritten != 1:
+        if complete and (self.rewritten != 1 or not self.finished):
             raise AgentTransportError("Isolated agent browser transport was not used; no host call emitted")
+
+    def on_request_finished(self, request):
+        if self.request is not None and request is self.request:
+            self.finished = True
+
+    def on_request_failed(self, request):
+        if self.request is not None and request is self.request:
+            self.failure = "Browser inference request failed; no host call emitted"
 
     async def route(self, route):
         request = route.request
@@ -268,6 +290,7 @@ class AgentBrowserTransport:
                 "prompt": [{"role": "user", "content": self.prompt}],
                 "systemPrompt": instructions,
             }
+            self.request = request
             self.rewritten += 1
             await route.continue_(url=urlunsplit(parts._replace(path=AGENT_ROUTE_TARGET, query="")),
                                   post_data=json.dumps(payload, ensure_ascii=False, allow_nan=False))
@@ -448,11 +471,7 @@ class BrowserSession:
         messages = page.locator(SEL_ASSISTANT)
         if await messages.count() <= baseline_count:
             return ""
-        if structured:
-            # Read the exact source of this assistant Markdown component. Rendered
-            # prose loses escapes; code fences can trigger native Venice tools.
-            return await messages.last.evaluate(AGENT_SOURCE_EXTRACTOR)
-        return await messages.last.inner_text()
+        return await messages.last.evaluate(AGENT_SOURCE_EXTRACTOR)
 
     async def _is_generating(self, page: Page) -> bool:
         try:
@@ -638,11 +657,15 @@ class BrowserSession:
                 raise
 
             transport = AgentBrowserTransport(prompt, structured)
+            page.on("requestfinished", transport.on_request_finished)
+            page.on("requestfailed", transport.on_request_failed)
             try:
                 await page.route(AGENT_ROUTE_PATTERN, transport.route)
                 answer = await self._generate_on_page(page, prompt, structured, transport)
                 transport.check(complete=True)
             finally:
+                page.remove_listener("requestfinished", transport.on_request_finished)
+                page.remove_listener("requestfailed", transport.on_request_failed)
                 await page.unroute(AGENT_ROUTE_PATTERN, transport.route)
             if on_delta:
                 await on_delta(answer)
@@ -667,7 +690,7 @@ class BrowserSession:
                 transport.check()
             await asyncio.sleep(0.3)
             answer = await self._answer(page, baseline_count, structured)
-            if answer.strip() or await self._is_generating(page):
+            if answer.strip() or transport.request is not None or await self._is_generating(page):
                 break
         else:
             await self._shot(page, "start_timeout")
@@ -691,7 +714,7 @@ class BrowserSession:
                 continue
 
             idle = time.monotonic() - last_change
-            if idle >= STABLE_SEC and not await self._is_generating(page):
+            if idle >= STABLE_SEC and transport.finished and not await self._is_generating(page):
                 break
         else:
             raise RuntimeError("Generation deadline exceeded; refusing to report a normal completion")

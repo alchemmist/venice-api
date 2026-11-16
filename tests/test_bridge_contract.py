@@ -37,7 +37,7 @@ class BridgeContractTests(unittest.IsolatedAsyncioTestCase):
         session = bridge.BrowserSession()
         messages = MagicMock()
         messages.count = AsyncMock(return_value=1)
-        messages.last.inner_text = AsyncMock(return_value="assistant\nprivate\nDeepSeek is a model\nsources")
+        messages.last.evaluate = AsyncMock(return_value="assistant\nprivate\nDeepSeek is a model\nsources")
         page = MagicMock()
         page.locator.return_value = messages
         self.assertEqual(await session._answer(page, 0), "assistant\nprivate\nDeepSeek is a model\nsources")

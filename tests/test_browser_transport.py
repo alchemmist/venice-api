@@ -24,6 +24,7 @@ class BrowserTransportTests(unittest.IsolatedAsyncioTestCase):
         transport = bridge.AgentBrowserTransport("fixture")
         route = self.route()
         await transport.route(route)
+        transport.on_request_finished(route.request)
         transport.check(complete=True)
         sent = route.continue_.call_args.kwargs
         self.assertEqual(sent["url"], bridge.AGENT_INFERENCE_ORIGIN + bridge.AGENT_ROUTE_TARGET)
@@ -52,6 +53,7 @@ class BrowserTransportTests(unittest.IsolatedAsyncioTestCase):
         transport = bridge.AgentBrowserTransport("fixture")
         route = self.route(prompt="/think fixture")
         await transport.route(route)
+        transport.on_request_finished(route.request)
         transport.check(complete=True)
         self.assertEqual(json.loads(route.continue_.call_args.kwargs["post_data"])["prompt"][0]["content"], "fixture")
         for text in (" /think fixture", "fixture extra", "/think /think fixture", "/no_think fixture"):
@@ -59,6 +61,24 @@ class BrowserTransportTests(unittest.IsolatedAsyncioTestCase):
             route = self.route(prompt=text)
             await transport.route(route)
             route.abort.assert_awaited_once()
+
+    async def test_only_the_bound_request_finish_allows_completion(self):
+        transport = bridge.AgentBrowserTransport("fixture")
+        route = self.route()
+        await transport.route(route)
+        transport.on_request_finished(self.route().request)
+        with self.assertRaises(bridge.AgentTransportError):
+            transport.check(complete=True)
+        transport.on_request_finished(route.request)
+        transport.check(complete=True)
+
+    async def test_bound_network_failure_is_explicit(self):
+        transport = bridge.AgentBrowserTransport("fixture")
+        route = self.route()
+        await transport.route(route)
+        transport.on_request_failed(route.request)
+        with self.assertRaisesRegex(bridge.AgentTransportError, "request failed"):
+            transport.check()
 
     async def test_browser_history_is_not_replayed(self):
         transport = bridge.AgentBrowserTransport("fixture")

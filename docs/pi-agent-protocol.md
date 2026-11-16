@@ -27,10 +27,11 @@ text-only browser transport contract and its fail-closed schema dependency.
   browser semantics, unchanged from plain chat.
 - The complete assistant source must be a raw v1 envelope, with no fences or
   extra prose. Only this rendered assistant component's pre-Markdown source is
-  read: bounded React fiber traversal, exact Markdown props markers, identical
-  duplicate sources, stop before parent message state. Missing/ambiguous props
-  fail closed; there is no fallback to lossy DOM text. UI internal changes can
-  break this path and require maintenance. No clipboard or raw network replay.
+  read from the nearest bound assistant message, before math/Markdown transforms:
+  bounded committed-tree identity lookup (50000 nodes,2048 root depth), at most48
+  local ancestors, strict assistant role/nonempty ID/string content, no history
+  contents, Markdown fallback or network replay. Unknown shapes fail closed.
+  Both plain/compaction and structured completions use this exact raw source.
   No regex command extraction, Markdown unwrapping or automatic format repair.
   Malformed output produces HTTP502 / typed SSE error, never a tool invocation.
   Duplicate JSON keys and non-finite numbers are rejected.
@@ -150,3 +151,16 @@ known prefix and unknown text transformations, wrong origin, repeated POSTs,
 plain/compaction instructions, cancellation cleanup and explicit error semantics.
 Live acceptance must reproduce the exact long nightly prompt in ordinary Pi,
 with actual checkpoint files and tests, rather than synthetic reads alone.
+
+## Classic dollar-sign regression
+
+The first exact nightly prompt after Classic rollout exposed another real defect.
+Network replies were valid envelopes, but Classic's pre-Markdown math processor
+changed `$?` and `${PIPESTATUS[0]}` into invalid JSON escapes `\$`. The earlier
+Markdown-props extractor therefore was NOT lossless on Classic. Reading this
+current assistant's original message content fixes the source boundary, without
+unescaping, JSON repair or modifying the model output. On the captured actual
+night request, four browser replays produced two invalid old-extractor envelopes
+and zero invalid raw-message envelopes. No tools were executed in those replays.
+The matching browser request must finish before any response is released; failed
+requests have explicit transport errors and all listeners/routes are removed.
