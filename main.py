@@ -44,14 +44,15 @@ import re
 import sys
 import time
 import uuid
+import weakref
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Optional
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from agent_protocol import AgentProtocol, ProtocolError, PromptBudgetError
 from playwright.async_api import BrowserContext, Page, async_playwright
@@ -125,7 +126,11 @@ STABLE_SEC   = float(os.getenv("STABLE_SEC", "2.0"))     # «тишина» = к
 MAX_PENDING_REQUESTS = max(1, int(os.getenv("MAX_PENDING_REQUESTS", "4")))
 QUEUE_TIMEOUT = float(os.getenv("QUEUE_TIMEOUT", "180"))
 MODEL_SELECT_TIMEOUT = float(os.getenv("MODEL_SELECT_TIMEOUT", "20"))
+EXTRACT_TIMEOUT = float(os.getenv("EXTRACT_TIMEOUT", "30"))
 NAV_TIMEOUT  = float(os.getenv("NAV_TIMEOUT", "90"))
+BROWSER_CLEANUP_TIMEOUT = float(os.getenv("BROWSER_CLEANUP_TIMEOUT", "15"))
+BROWSER_PAGE_TIMEOUT = float(os.getenv("BROWSER_PAGE_TIMEOUT", "30"))
+BROWSER_PREPARE_TIMEOUT = float(os.getenv("BROWSER_PREPARE_TIMEOUT", "300"))
 DEBUG        = _env_bool("DEBUG", False)
 DEBUG_DIR    = Path(os.getenv("DEBUG_DIR", "./debug")).resolve()
 
@@ -308,12 +313,20 @@ class BrowserSession:
 
     def __init__(self) -> None:
         self._pw = None
+        self._browser = None
         self._ctx: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._lock = asyncio.Lock()
         self._cdp = False
         self._pending = 0
         self._authenticated = False
+        self._closed_ids: weakref.WeakSet = weakref.WeakSet()
+        self._watched_ids: weakref.WeakSet = weakref.WeakSet()
+        self._context_browser_ids: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self._stop_acknowledged = False
+
+    async def _bounded(self, awaitable, timeout: float):
+        return await asyncio.wait_for(awaitable, timeout)
 
     @asynccontextmanager
     async def request_slot(self):
@@ -330,11 +343,22 @@ class BrowserSession:
             try:
                 yield
             except asyncio.CancelledError:
-                if self._page and not self._page.is_closed():
-                    with contextlib.suppress(Exception):
-                        stop = self._page.locator(SEL_STOP).first
-                        if await stop.count() and await stop.is_visible():
-                            await stop.click(timeout=1000)
+                self._stop_acknowledged = False
+                try:
+                    page = self._page
+                    if page is not None and not page.is_closed():
+                        stop = page.locator(SEL_STOP).first
+                        count = await self._bounded(stop.count(), BROWSER_CLEANUP_TIMEOUT)
+                        visible = False
+                        if count:
+                            visible = await self._bounded(stop.is_visible(), BROWSER_CLEANUP_TIMEOUT)
+                        if count and visible:
+                            await self._bounded(stop.click(timeout=1000), BROWSER_CLEANUP_TIMEOUT)
+                            self._stop_acknowledged = True
+                except Exception:
+                    self._stop_acknowledged = False
+                if not self._stop_acknowledged:
+                    log.warning("Stop was not acknowledged within the cleanup bound; this is not a confirmed physical cancellation")
                 raise
         finally:
             if acquired:
@@ -343,13 +367,84 @@ class BrowserSession:
 
     # ------------------------- низкий уровень ------------------------------ #
 
+    def _bind_browser(self, browser) -> None:
+        if browser is None:
+            return
+        self._browser = browser
+        if browser in self._watched_ids:
+            return
+        self._watched_ids.add(browser)
+
+        def on_disconnected(bound=browser) -> None:
+            self._closed_ids.add(bound)
+
+        browser.on("disconnected", on_disconnected)
+
+    def _bind_context(self, ctx) -> None:
+        if ctx is None or ctx in self._watched_ids:
+            return
+        self._watched_ids.add(ctx)
+        browser = self._browser
+        if browser is not None:
+            self._context_browser_ids[ctx] = weakref.ref(browser)
+
+        def on_close(bound=ctx) -> None:
+            self._closed_ids.add(bound)
+
+        ctx.on("close", on_close)
+
+    def _context_is_open(self, ctx: object) -> bool:
+        if ctx is None or ctx in self._closed_ids:
+            return False
+        browser_ref = self._context_browser_ids.get(ctx)
+        bound = browser_ref() if browser_ref is not None else None
+        if browser_ref is not None and (bound is None or bound in self._closed_ids):
+            return False
+        browser = self._browser
+        if browser is not None and (bound is None or bound is browser):
+            try:
+                connected = browser.is_connected()
+            except Exception:
+                return False
+            if connected is not True:
+                return False
+        return True
+
+    async def _drop_local_driver(self) -> None:
+        pw = self._pw
+        self._pw = None
+        self._browser = None
+        self._ctx = None
+        self._page = None
+        self._cdp = False
+        if pw is not None:
+            with contextlib.suppress(Exception):
+                await self._bounded(pw.stop(), BROWSER_CLEANUP_TIMEOUT)
+
     async def _launch(self) -> None:
         self._pw = await async_playwright().start()
+        try:
+            await self._launch_connected()
+        except BaseException:
+            await self._drop_local_driver()
+            raise
+
+    async def _launch_connected(self) -> None:
+        self._cdp = False
         cdp = os.getenv("CDP_URL", "").strip()
         if cdp:
-            browser = await self._pw.chromium.connect_over_cdp(cdp)
+            browser = await self._bounded(self._pw.chromium.connect_over_cdp(cdp), BROWSER_PAGE_TIMEOUT)
             self._cdp = True
-            self._ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+            self._bind_browser(browser)
+            open_contexts = []
+            for ctx in browser.contexts:
+                self._bind_context(ctx)
+                if self._context_is_open(ctx):
+                    open_contexts.append(ctx)
+            if not open_contexts:
+                await self._drop_local_driver()
+                raise RuntimeError("CDP browser has no persistent context")
+            self._ctx = open_contexts[0]
             self._ctx.set_default_timeout(30_000)
             log.info("Подключен Chrome по CDP %s", cdp)
             return
@@ -383,7 +478,9 @@ class BrowserSession:
         if proxy_server:
             kwargs["proxy"] = {"server": proxy_server}
             log.info("Браузер через прокси %s", proxy_server)
-        self._ctx = await self._pw.chromium.launch_persistent_context(**kwargs)
+        self._ctx = await self._bounded(self._pw.chromium.launch_persistent_context(**kwargs), BROWSER_PAGE_TIMEOUT)
+        self._bind_browser(self._ctx.browser)
+        self._bind_context(self._ctx)
         await self._ctx.add_init_script(STEALTH_JS)
         self._ctx.set_default_timeout(30_000)
         if profile_dir:
@@ -392,7 +489,8 @@ class BrowserSession:
             try:
                 await self._apply_saved_cookies()
             except Exception:
-                await self.close()
+                with contextlib.suppress(Exception):
+                    await self.close()
                 raise
 
     async def _apply_saved_cookies(self) -> None:
@@ -436,14 +534,19 @@ class BrowserSession:
             log.info("Подставлено cookies: %s", len(cookies))
 
     async def _page_or_start(self, *, recycle: bool = False) -> Page:
+        if self._ctx is not None and not self._context_is_open(self._ctx):
+            await self._drop_local_driver()
         if self._page and not self._page.is_closed() and urlsplit(self._page.url).hostname == urlsplit(BASE_URL).hostname:
             if not recycle or not self._authenticated:
                 return self._page
             assert self._ctx is not None
+            new = await self._bounded(self._ctx.new_page(), BROWSER_PAGE_TIMEOUT)
             old = self._page
-            await old.close()
-            self._page = None
-            self._page = await self._ctx.new_page()
+            self._page = new
+            try:
+                await self._bounded(old.close(), BROWSER_CLEANUP_TIMEOUT)
+            except Exception:
+                log.warning("Previous page close exceeded the cleanup bound after its replacement was open")
             return self._page
         if self._ctx is None:
             await self._launch()
@@ -451,7 +554,7 @@ class BrowserSession:
         pages = [p for p in self._ctx.pages if not p.is_closed()]
         self._page = next((p for p in pages if urlsplit(p.url).hostname == urlsplit(BASE_URL).hostname), None)
         if self._page is None:
-            self._page = await self._ctx.new_page()
+            self._page = await self._bounded(self._ctx.new_page(), BROWSER_PAGE_TIMEOUT)
         return self._page
 
     async def close(self) -> None:
@@ -459,11 +562,12 @@ class BrowserSession:
         if not self._cdp:
             with contextlib.suppress(Exception):
                 if self._ctx:
-                    await self._ctx.close()
+                    await self._bounded(self._ctx.close(), BROWSER_CLEANUP_TIMEOUT)
         with contextlib.suppress(Exception):
             if self._pw:
-                await self._pw.stop()
-        self._ctx = self._page = self._pw = None
+                await self._bounded(self._pw.stop(), BROWSER_CLEANUP_TIMEOUT)
+        self._ctx = self._page = self._pw = self._browser = None
+        self._cdp = False
         self._authenticated = False
 
     # ------------------------- утилиты страницы ---------------------------- #
@@ -481,9 +585,12 @@ class BrowserSession:
 
     async def _answer(self, page: Page, baseline_count: int, structured: bool = False) -> str:
         messages = page.locator(SEL_ASSISTANT)
-        if await messages.count() <= baseline_count:
+        if await asyncio.wait_for(messages.count(), EXTRACT_TIMEOUT) <= baseline_count:
             return ""
-        source = await messages.last.evaluate(AGENT_SOURCE_EXTRACTOR)
+        source = await asyncio.wait_for(
+            messages.last.evaluate(AGENT_SOURCE_EXTRACTOR, timeout=EXTRACT_TIMEOUT * 1000),
+            EXTRACT_TIMEOUT,
+        )
         return source if isinstance(source, str) else None
 
     async def _is_generating(self, page: Page) -> bool:
@@ -668,7 +775,10 @@ class BrowserSession:
         async with self.request_slot():
             page = await self._page_or_start(recycle=NEW_CHAT_PER_REQUEST)
             try:
-                await self._prepare(page)
+                await self._bounded(self._prepare(page), BROWSER_PREPARE_TIMEOUT)
+            except (asyncio.TimeoutError, TimeoutError):
+                await self._shot(page, "prepare_fail")
+                raise RuntimeError("Browser prepare phase exceeded its bound") from None
             except Exception:
                 await self._shot(page, "prepare_fail")
                 raise
@@ -677,18 +787,35 @@ class BrowserSession:
             page.on("requestfinished", transport.on_request_finished)
             page.on("requestfailed", transport.on_request_failed)
             try:
-                await page.route(AGENT_ROUTE_PATTERN, transport.route)
+                await self._bounded(page.route(AGENT_ROUTE_PATTERN, transport.route), BROWSER_PAGE_TIMEOUT)
                 answer = await self._generate_on_page(page, prompt, structured, transport)
                 transport.check(complete=True)
             finally:
-                page.remove_listener("requestfinished", transport.on_request_finished)
-                page.remove_listener("requestfailed", transport.on_request_failed)
-                await page.unroute(AGENT_ROUTE_PATTERN, transport.route)
+                primary = sys.exc_info()[1]
+                try:
+                    page.remove_listener("requestfinished", transport.on_request_finished)
+                    page.remove_listener("requestfailed", transport.on_request_failed)
+                    await self._bounded(page.unroute(AGENT_ROUTE_PATTERN, transport.route), BROWSER_CLEANUP_TIMEOUT)
+                except Exception:
+                    if primary is None:
+                        raise
+                    log.warning("Browser transport cleanup failed after the primary error")
             if on_delta:
                 await on_delta(answer)
             return answer
 
     async def _generate_on_page(self, page, prompt, structured, transport):
+        budget = START_TIMEOUT + GEN_TIMEOUT
+        try:
+            return await self._bounded(
+                self._generate_within_budget(page, prompt, structured, transport),
+                budget,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            await self._shot(page, "start_timeout")
+            raise RuntimeError("Generation deadline exceeded; refusing to report a normal completion") from None
+
+    async def _generate_within_budget(self, page, prompt, structured, transport):
         baseline_count = await page.locator(SEL_ASSISTANT).count()
 
         ta = page.locator(SEL_TEXTAREA).first
@@ -734,10 +861,13 @@ class BrowserSession:
                 continue
 
             idle = time.monotonic() - last_change
-            settle_window = max(STABLE_SEC, 5) if current is None else STABLE_SEC
+            pending_source = current is None or not str(current).strip()
+            settle_window = max(STABLE_SEC, 5) if pending_source else STABLE_SEC
             if (idle >= STABLE_SEC and finished_seen is not None
                     and time.monotonic() - finished_seen >= settle_window
                     and not await self._is_generating(page)):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Generation deadline exceeded; refusing to report a normal completion")
                 break
         else:
             raise RuntimeError("Generation deadline exceeded; refusing to report a normal completion")
@@ -963,13 +1093,20 @@ async def list_models() -> dict[str, Any]:
     }
 
 
+async def _until_http_disconnect(request: Request) -> None:
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return
+
+
 @app.post(
     "/v1/chat/completions",
     summary="Чат-комплишн (stream и non-stream)",
     response_model=None,
     dependencies=[Depends(_auth)],
 )
-async def chat_completions(req: ChatCompletionRequest):
+async def chat_completions(req: ChatCompletionRequest, request: Request = None):
     if req.model != MODEL_ID:
         raise HTTPException(400, "Unsupported model")
     protocol = None
@@ -1030,19 +1167,38 @@ async def chat_completions(req: ChatCompletionRequest):
         raise AssertionError("Unreachable regeneration state")
 
     if not req.stream:
+        task = asyncio.create_task(generate_decoded())
+        disconnected = asyncio.create_task(_until_http_disconnect(request)) if request is not None else None
         try:
-            message, finish, usage = await generate_decoded()
-        except AgentTransportError as exc:
-            raise HTTPException(502, str(exc)) from None
-        except ProtocolError as exc:
-            ref = getattr(exc, "diagnostic_id", None)
-            raise HTTPException(502, "Invalid assistant agent envelope; no tool call emitted" +
-                                (f"; diagnostic_id={ref}" if ref else "")) from None
-        except BrowserBusyError as exc:
-            raise HTTPException(429, str(exc), headers={"Retry-After": "5"}) from None
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Ошибка генерации")
-            raise HTTPException(502, f"Ошибка браузерной сессии: {exc}") from exc
+            if disconnected is not None:
+                await asyncio.wait({task, disconnected}, return_when=asyncio.FIRST_COMPLETED)
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    return Response(status_code=499)
+            try:
+                message, finish, usage = task.result() if disconnected is not None else await task
+            except AgentTransportError as exc:
+                raise HTTPException(502, str(exc)) from None
+            except ProtocolError as exc:
+                ref = getattr(exc, "diagnostic_id", None)
+                raise HTTPException(502, "Invalid assistant agent envelope; no tool call emitted" +
+                                    (f"; diagnostic_id={ref}" if ref else "")) from None
+            except BrowserBusyError as exc:
+                raise HTTPException(429, str(exc), headers={"Retry-After": "5"}) from None
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Ошибка генерации")
+                raise HTTPException(502, f"Ошибка браузерной сессии: {exc}") from exc
+        finally:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            if disconnected is not None and not disconnected.done():
+                disconnected.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await disconnected
 
         return {
             "id": cid,
@@ -1081,6 +1237,8 @@ async def chat_completions(req: ChatCompletionRequest):
         except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка генерации (stream)")
             await queue.put(("error", {"message": str(exc), "type": "upstream_error"}))
+        except BaseException as exc:
+            await queue.put(("error", {"message": type(exc).__name__, "type": "upstream_error"}))
 
     def sse(obj: dict[str, Any]) -> str:
         return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
@@ -1102,6 +1260,12 @@ async def chat_completions(req: ChatCompletionRequest):
         try:
             yield chunk({"role": "assistant", "content": ""})
             while True:
+                if task.done() and queue.empty():
+                    with contextlib.suppress(BaseException):
+                        task.result()
+                    yield sse({"error": {"message": "upstream generation failed", "type": "upstream_error"}})
+                    yield "data: [DONE]\n\n"
+                    break
                 try:
                     kind, payload = await asyncio.wait_for(queue.get(), timeout=15)
                 except asyncio.TimeoutError:

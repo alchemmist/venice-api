@@ -198,3 +198,27 @@ class BrowserTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("upstream_agent_transport_error", output)
         self.assertNotIn('"finish_reason": "stop"', output)
         self.assertNotIn('"tool_calls"', output)
+
+    async def _stream_terminal_failure(self, exc):
+        request = bridge.ChatCompletionRequest(messages=[{"role": "user", "content": "fixture"}], stream=True)
+
+        async def complete(*_args, **_kwargs):
+            raise exc
+
+        with patch.object(bridge.SESSION, "complete", complete):
+            response = await bridge.chat_completions(request)
+            async def collect():
+                return "".join([chunk async for chunk in response.body_iterator])
+
+            output = await asyncio.wait_for(collect(), timeout=1.0)
+        self.assertNotIn(": keep-alive", output)
+        self.assertNotIn('"finish_reason": "stop"', output)
+        self.assertIn('"error"', output)
+        leftover = [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
+        self.assertEqual(leftover, [])
+
+    async def test_stream_worker_cancelled_error_does_not_keepalive(self):
+        await self._stream_terminal_failure(asyncio.CancelledError())
+
+    async def test_stream_worker_base_exception_does_not_keepalive(self):
+        await self._stream_terminal_failure(BaseException())
